@@ -64,6 +64,14 @@ class MotorSim:
         self.running = False
         self.estopped = True
 
+    def stop_motion(self):
+        """Decelerate to stop without latching the e-stop flag (used by jog release)."""
+        self.velocity = 0.0
+        self.target_position = self.position
+        self.running = False
+        self.cmd_complete = True
+        self.path_complete = True
+
     def clear_estop(self):
         self.estopped = False
 

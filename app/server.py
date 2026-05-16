@@ -1,6 +1,7 @@
-"""FastAPI application with REST + WebSocket for dual-motor control."""
+"""FastAPI application with REST + WebSocket for multi-motor control (up to 5 motors)."""
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,10 +10,10 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .config import load_config, save_config
+from .config import load_config, save_config, MAX_MOTORS
 from .modbus_interface import ModbusInterface, SimulatedModbus, RealModbus, TcpModbus
 from .motor_sim import MotorSim
-from .sequencer import DualMotorSequencer
+from .sequencer import MultiMotorSequencer, MotorStep
 from .registers import (
     MOTION_STATUS, FEEDBACK_POS_H, FEEDBACK_POS_L,
     FEEDBACK_VEL_H, FEEDBACK_VEL_L, CURRENT_ALARM,
@@ -25,17 +26,20 @@ from .registers import (
 # --- Globals set during lifespan ---
 config: dict
 modbus: ModbusInterface
-sequencer: DualMotorSequencer
-motor1: MotorSim | None = None
-motor2: MotorSim | None = None
+sequencer: MultiMotorSequencer
+sim_motors: dict[int, MotorSim] = {}
 ws_clients: set[WebSocket] = set()
 # Software zero offsets per slave ID (in pulses)
 zero_offsets: dict[int, int] = {}
 
 
+def _slave_ids() -> list[int]:
+    return list(config["motors"].get("slave_ids", []))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global config, modbus, sequencer, motor1, motor2
+    global config, modbus, sequencer, sim_motors
     config = load_config()
 
     from .registers import set_pulses_per_rev
@@ -44,9 +48,9 @@ async def lifespan(app: FastAPI):
         encoder_ppr=config["motors"].get("encoder_ppr", 10000),
     )
 
-    m1_id = config["motors"]["motor1_slave_id"]
-    m2_id = config["motors"]["motor2_slave_id"]
+    ids = _slave_ids()
     conn = config["connection"]
+    sim_motors = {}
 
     if conn["mode"] == "hardware":
         real = RealModbus(
@@ -58,8 +62,6 @@ async def lifespan(app: FastAPI):
         )
         await real.connect()
         modbus = real
-        motor1 = None
-        motor2 = None
     elif conn["mode"] == "tcp":
         tcp = TcpModbus(
             host=conn.get("tcp_host", "192.168.1.100"),
@@ -67,31 +69,35 @@ async def lifespan(app: FastAPI):
         )
         await tcp.connect()
         modbus = tcp
-        motor1 = None
-        motor2 = None
     else:
-        motor1 = MotorSim(slave_id=m1_id)
-        motor2 = MotorSim(slave_id=m2_id)
-        modbus = SimulatedModbus({m1_id: motor1, m2_id: motor2})
-        motor1.start()
-        motor2.start()
+        sim_motors = {sid: MotorSim(slave_id=sid) for sid in ids}
+        modbus = SimulatedModbus(sim_motors)
+        for m in sim_motors.values():
+            m.start()
 
-    sequencer = DualMotorSequencer(modbus, motor1_id=m1_id, motor2_id=m2_id)
+    sequencer = MultiMotorSequencer(modbus, slave_ids=ids)
 
     broadcast_task = asyncio.create_task(_broadcast_loop())
     yield
     broadcast_task.cancel()
-    if motor1:
-        await motor1.stop()
-    if motor2:
-        await motor2.stop()
+    for m in sim_motors.values():
+        await m.stop()
     if isinstance(modbus, (RealModbus, TcpModbus)):
         await modbus.disconnect()
 
 
 app = FastAPI(lifespan=lifespan)
 
-STATIC_DIR = Path(__file__).parent.parent / "static"
+
+def _static_dir() -> Path:
+    """Static asset dir. When frozen, the launcher sets PYSIM_RESOURCE_ROOT to sys._MEIPASS."""
+    env = os.environ.get("PYSIM_RESOURCE_ROOT")
+    if env:
+        return Path(env) / "static"
+    return Path(__file__).parent.parent / "static"
+
+
+STATIC_DIR = _static_dir()
 
 
 # --- Pydantic models ---
@@ -106,6 +112,7 @@ class MoveRequest(BaseModel):
 
 
 class MotorParams(BaseModel):
+    slave_id: int
     angle_deg: float = 90.0
     speed_rpm: int = 200
     accel: int = 200
@@ -113,8 +120,7 @@ class MotorParams(BaseModel):
 
 
 class SequenceRequest(BaseModel):
-    m1: MotorParams = MotorParams()
-    m2: MotorParams = MotorParams()
+    motors: list[MotorParams]
     delay_s: float = 1.0
     mode: str = "relative"
 
@@ -124,10 +130,22 @@ class AlarmResetRequest(BaseModel):
 
 
 class HomeRequest(BaseModel):
-    slave_id: int = 0  # 0 = both, 1 = motor1, 2 = motor2
+    slave_id: int = 0  # 0 = all motors, otherwise a specific slave_id
     speed_rpm: int = 200
     accel: int = 200
     decel: int = 200
+
+
+class JogStartRequest(BaseModel):
+    slave_id: int
+    direction: int = 1  # +1 forward, -1 reverse
+    speed_rpm: int = 60
+    accel: int = 200
+    decel: int = 200
+
+
+class JogStopRequest(BaseModel):
+    slave_id: int
 
 
 # --- Routes ---
@@ -167,13 +185,53 @@ async def move_motor(req: MoveRequest):
 async def run_sequence(req: SequenceRequest):
     if sequencer.active:
         return {"error": "Sequence already running"}
+    if not req.motors:
+        return {"error": "No motors in sequence"}
 
     mode_val = MODE_ABSOLUTE if req.mode == "absolute" else MODE_RELATIVE
-    asyncio.create_task(sequencer.run_sequence(
-        m1_angle=req.m1.angle_deg, m1_speed=req.m1.speed_rpm, m1_accel=req.m1.accel, m1_decel=req.m1.decel,
-        m2_angle=req.m2.angle_deg, m2_speed=req.m2.speed_rpm, m2_accel=req.m2.accel, m2_decel=req.m2.decel,
-        delay_s=req.delay_s, mode=mode_val,
-    ))
+    steps = [
+        MotorStep(
+            slave_id=m.slave_id,
+            angle_deg=m.angle_deg,
+            speed_rpm=m.speed_rpm,
+            accel=m.accel,
+            decel=m.decel,
+        )
+        for m in req.motors
+    ]
+    asyncio.create_task(sequencer.run_sequence(steps=steps, delay_s=req.delay_s, mode=mode_val))
+    return {"ok": True}
+
+
+@app.post("/api/jog/start")
+async def jog_start(req: JogStartRequest):
+    """Begin a jog: issue a large relative move at the requested speed. Stop with /api/jog/stop."""
+    if sequencer.active:
+        return {"error": "Sequence in progress"}
+
+    from .registers import PR0_MODE, PR0_TRIGGER, PR0_TRIGGER_VAL, degrees_to_pulses, split_32
+
+    # 100 revolutions worth of motion in the requested direction.
+    # The user releases the jog button → /api/jog/stop decelerates before this finishes.
+    angle = 36000.0 * (1 if req.direction >= 0 else -1)
+    pulses = degrees_to_pulses(angle)
+    pos_h, pos_l = split_32(pulses)
+    await modbus.write_registers(req.slave_id, PR0_MODE, [
+        MODE_RELATIVE, pos_h, pos_l, req.speed_rpm, req.accel, req.decel,
+    ])
+    await modbus.write_registers(req.slave_id, PR0_TRIGGER, [PR0_TRIGGER_VAL])
+    return {"ok": True}
+
+
+@app.post("/api/jog/stop")
+async def jog_stop(req: JogStopRequest):
+    """Stop a jogging motor without latching e-stop."""
+    sid = req.slave_id
+    if isinstance(modbus, SimulatedModbus) and sid in modbus.motors:
+        modbus.motors[sid].stop_motion()
+    else:
+        # On real hardware, writing the stop value to ESTOP_REG decelerates the motor.
+        await modbus.write_registers(sid, ESTOP_REG, [ESTOP_VAL])
     return {"ok": True}
 
 
@@ -185,13 +243,7 @@ async def home_motor(req: HomeRequest):
 
     from .registers import PR0_MODE, PR0_TRIGGER, PR0_TRIGGER_VAL, split_32
 
-    m1_id = config["motors"]["motor1_slave_id"]
-    m2_id = config["motors"]["motor2_slave_id"]
-    targets = []
-    if req.slave_id == 0:
-        targets = [m1_id, m2_id]
-    else:
-        targets = [req.slave_id]
+    targets = _slave_ids() if req.slave_id == 0 else [req.slave_id]
 
     for sid in targets:
         # Absolute move to the zero-offset position (user's 0)
@@ -209,9 +261,7 @@ async def home_motor(req: HomeRequest):
 async def set_zero(req: AlarmResetRequest):
     """Set current position as 0 by storing a software offset."""
     sid = req.slave_id
-    m1_id = config["motors"]["motor1_slave_id"]
-    m2_id = config["motors"]["motor2_slave_id"]
-    targets = [m1_id, m2_id] if sid == 0 else [sid]
+    targets = _slave_ids() if sid == 0 else [sid]
 
     for t in targets:
         if isinstance(modbus, SimulatedModbus) and t in modbus.motors:
@@ -240,30 +290,24 @@ async def alarm_reset(req: AlarmResetRequest):
 
 @app.post("/api/save")
 async def save_params():
-    m1_id = config["motors"]["motor1_slave_id"]
-    m2_id = config["motors"]["motor2_slave_id"]
-    await modbus.write_registers(m1_id, SYSTEM_CMD_REG, [PERM_SAVE_VAL])
-    await modbus.write_registers(m2_id, SYSTEM_CMD_REG, [PERM_SAVE_VAL])
+    for sid in _slave_ids():
+        await modbus.write_registers(sid, SYSTEM_CMD_REG, [PERM_SAVE_VAL])
     return {"ok": True}
 
 
 @app.post("/api/enable")
 async def enable_motors():
     from .registers import SW_ENABLE_REG, SW_ENABLE_VAL
-    m1_id = config["motors"]["motor1_slave_id"]
-    m2_id = config["motors"]["motor2_slave_id"]
-    await modbus.write_registers(m1_id, SW_ENABLE_REG, [SW_ENABLE_VAL])
-    await modbus.write_registers(m2_id, SW_ENABLE_REG, [SW_ENABLE_VAL])
+    for sid in _slave_ids():
+        await modbus.write_registers(sid, SW_ENABLE_REG, [SW_ENABLE_VAL])
     return {"ok": True}
 
 
 @app.post("/api/disable")
 async def disable_motors():
     from .registers import SW_ENABLE_REG
-    m1_id = config["motors"]["motor1_slave_id"]
-    m2_id = config["motors"]["motor2_slave_id"]
-    await modbus.write_registers(m1_id, SW_ENABLE_REG, [0])
-    await modbus.write_registers(m2_id, SW_ENABLE_REG, [0])
+    for sid in _slave_ids():
+        await modbus.write_registers(sid, SW_ENABLE_REG, [0])
     return {"ok": True}
 
 
@@ -286,16 +330,14 @@ async def list_serial_ports():
 
 @app.post("/api/test-connection")
 async def test_connection():
-    """Test connection by pinging both motors via the configured protocol."""
+    """Test connection by pinging every configured motor via the configured protocol."""
     conn = config["connection"]
-    m1_id = config["motors"]["motor1_slave_id"]
-    m2_id = config["motors"]["motor2_slave_id"]
+    ids = _slave_ids()
     mode = conn.get("mode", "simulation")
 
     if mode == "simulation":
         return {"ok": True, "motors": [
-            {"ok": True, "slave_id": m1_id, "status": 0},
-            {"ok": True, "slave_id": m2_id, "status": 0},
+            {"ok": True, "slave_id": sid, "status": 0} for sid in ids
         ]}
 
     try:
@@ -320,7 +362,7 @@ async def test_connection():
                 return {"ok": False, "error": f"Cannot open {conn['serial_port']}"}
 
         results = []
-        for sid in [m1_id, m2_id]:
+        for sid in ids:
             r = await test_client.test_connection(sid)
             results.append(r)
 
@@ -356,7 +398,7 @@ async def debug_registers(slave_id: int):
 
 @app.get("/api/config")
 async def get_config():
-    return config
+    return {**config, "max_motors": MAX_MOTORS}
 
 
 @app.post("/api/config")
@@ -408,11 +450,14 @@ async def _broadcast_loop():
 async def _build_status() -> dict:
     """Read motor registers and build status dict."""
     from .registers import STATUS_RUNNING, STATUS_CMD_OK, STATUS_PATH_OK
-    m1_id = config["motors"]["motor1_slave_id"]
-    m2_id = config["motors"]["motor2_slave_id"]
-    result = {"motors": {}, "sequence": {"phase": sequencer.phase, "active": sequencer.active, "error": sequencer.error}}
+    ids = _slave_ids()
+    result = {
+        "slave_ids": ids,
+        "motors": {},
+        "sequence": {"phase": sequencer.phase, "active": sequencer.active, "error": sequencer.error},
+    }
 
-    for sid in [m1_id, m2_id]:
+    for sid in ids:
         try:
             status_regs = await modbus.read_holding_registers(sid, MOTION_STATUS, 1)
             pos_regs = await modbus.read_holding_registers(sid, FEEDBACK_POS_H, 2)

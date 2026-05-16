@@ -1,0 +1,58 @@
+name: Build Windows EXE
+
+# Runs on every push to main, on every tag like v1.0.0, and from the
+# "Run workflow" button in the Actions tab.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --clean --noconfirm Pysim.spec
+
+      - name: Verify build
+        run: |
+          if (-not (Test-Path "dist\iCL-RS-Controller.exe")) {
+            Write-Error "Build did not produce dist\iCL-RS-Controller.exe"
+            exit 1
+          }
+          $size = (Get-Item "dist\iCL-RS-Controller.exe").Length / 1MB
+          Write-Host ("Built iCL-RS-Controller.exe — {0:N1} MB" -f $size)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iCL-RS-Controller-windows
+          path: dist/iCL-RS-Controller.exe
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/iCL-RS-Controller.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
