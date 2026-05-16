@@ -35,7 +35,12 @@ os.environ.setdefault("PYSIM_RESOURCE_ROOT", str(_resource_root()))
 os.environ.setdefault("PYSIM_CONFIG_DIR", str(_writable_root()))
 
 # Import after env vars are set so module-level path constants resolve correctly.
+# Importing the FastAPI app object directly (rather than letting uvicorn resolve
+# the "app.server:app" string at runtime) is required for the PyInstaller bundle:
+# the static analyzer can't trace dynamic string imports, so we must reference the
+# module explicitly here for it to get pulled in.
 from app.config import load_config  # noqa: E402
+from app.server import app as fastapi_app  # noqa: E402
 
 
 def _open_browser_when_ready(url: str, delay: float = 1.5) -> None:
@@ -58,7 +63,7 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run("app.server:app", host=host, port=port, reload=False, log_level="info")
+    uvicorn.run(fastapi_app, host=host, port=port, reload=False, log_level="info")
 
 
 if __name__ == "__main__":

@@ -13,7 +13,11 @@ block_cipher = None
 # its http and websocket protocol modules dynamically, so collect_submodules
 # guarantees they end up in the bundle even though static analysis can't see them.
 hidden = (
-    collect_submodules("uvicorn")
+    # Our own package — defensive; launcher.py already imports app.server, but
+    # listing this guards against future modules being added that the launcher
+    # doesn't import directly.
+    collect_submodules("app")
+    + collect_submodules("uvicorn")
     + collect_submodules("uvicorn.protocols")
     + collect_submodules("uvicorn.lifespan")
     + collect_submodules("uvicorn.loops")
