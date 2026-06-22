@@ -1,4 +1,13 @@
-"""FastAPI application with REST + WebSocket for multi-motor control (up to 5 motors)."""
+"""FastAPI server for multi-gateway, multi-motor control.
+
+Each *gateway* is one Modbus-TCP↔RTU bridge with up to 20 motors hanging off
+its RS485 side. The server opens one :class:`TcpModbus` per gateway in
+:func:`lifespan` and builds a :class:`MotorDriver` for every configured motor,
+keyed by ``"<gateway-id>.<slave-id>"`` (e.g. ``"gw1.5"``).
+
+Endpoints take a ``motor_key`` instead of a bare slave_id so the same slave_id
+on different gateways doesn't collide.
+"""
 
 import asyncio
 import os
@@ -7,90 +16,168 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .config import load_config, save_config, MAX_MOTORS
-from .modbus_interface import ModbusInterface, SimulatedModbus, RealModbus, TcpModbus
+from .config import (
+    load_config, save_config,
+    MAX_TOTAL_MOTORS, MAX_GATEWAYS, MAX_MOTORS_PER_GATEWAY,
+    motor_key as build_motor_key, motor_label,
+    driver_type_for,
+    ALLOWED_DRIVER_TYPES, DEFAULT_DRIVER_TYPE,
+)
+from .drivers import (
+    MotorDriver, DRIVER_CATALOG,
+    make_hardware_driver, make_sim_driver,
+)
+from .modbus_interface import ModbusInterface, SimulatedModbus, TcpModbus
 from .motor_sim import MotorSim
 from .sequencer import MultiMotorSequencer, MotorStep
-from .registers import (
-    MOTION_STATUS, FEEDBACK_POS_H, FEEDBACK_POS_L,
-    FEEDBACK_VEL_H, FEEDBACK_VEL_L, CURRENT_ALARM,
-    ESTOP_REG, ESTOP_VAL, SYSTEM_CMD_REG,
-    ALARM_RESET_VAL, PERM_SAVE_VAL,
-    MODE_RELATIVE, MODE_ABSOLUTE,
-    join_32, join_32_signed, pulses_to_degrees,
+from .show import (
+    ShowController, TransitionOptions, effects_catalog, face_for_position,
+    DEFAULT_SPEED_RPM, DEFAULT_ACCEL, DEFAULT_DECEL, DEFAULT_STEP_MS,
 )
 
-# --- Globals set during lifespan ---
-config: dict
-modbus: ModbusInterface
-sequencer: MultiMotorSequencer
-sim_motors: dict[int, MotorSim] = {}
+
+# --- Globals set during lifespan -------------------------------------------
+config: dict = {}
+gateways: dict[str, ModbusInterface] = {}        # gateway_id → modbus client
+drivers: dict[str, MotorDriver] = {}             # motor_key → driver
+sim_motors: dict[str, MotorSim] = {}             # motor_key → simulator (sim mode only)
+sequencer: MultiMotorSequencer | None = None
+show: ShowController = ShowController()
 ws_clients: set[WebSocket] = set()
-# Software zero offsets per slave ID (in pulses)
-zero_offsets: dict[int, int] = {}
+# Software zero offsets per motor key (encoder pulses)
+zero_offsets: dict[str, int] = {}
 
 
-def _slave_ids() -> list[int]:
-    return list(config["motors"].get("slave_ids", []))
+def _motor_specs() -> list[dict]:
+    return list(config.get("motors", []))
+
+
+def _motor_keys() -> list[str]:
+    return [build_motor_key(m["gateway"], m["slave_id"]) for m in _motor_specs()]
+
+
+def _label_for(key: str) -> str:
+    """Pretty label for a motor key — derived from gateway id + slave_id."""
+    if "." not in key:
+        return key
+    gw, sid = key.rsplit(".", 1)
+    try:
+        return motor_label(gw, int(sid))
+    except (TypeError, ValueError):
+        return key
+
+
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+
+_reload_lock = asyncio.Lock()
+
+
+async def _build_runtime(cfg: dict):
+    """Construct gateways, drivers, and sim motors for *cfg*.
+
+    Returns ``(gateways, drivers, sim_motors)`` — caller decides when to swap
+    them into the module-level globals.
+    """
+    from .registers import set_pulses_per_rev
+    md = cfg.get("motor_defaults", {})
+    set_pulses_per_rev(
+        command_ppr=int(md.get("command_ppr", 4000)),
+        encoder_ppr=int(md.get("encoder_ppr", 4000)),
+    )
+
+    new_gws: dict[str, ModbusInterface] = {}
+    new_drivers: dict[str, MotorDriver] = {}
+    new_sims: dict[str, MotorSim] = {}
+
+    mode = cfg.get("mode", "simulation")
+    if mode == "tcp":
+        for gw in cfg.get("gateways", []):
+            client = TcpModbus(host=gw["host"], port=int(gw["port"]))
+            try:
+                await client.connect()
+            except Exception:
+                pass
+            new_gws[gw["id"]] = client
+        for m in cfg.get("motors", []):
+            client = new_gws.get(m["gateway"])
+            if client is None:
+                continue
+            key = build_motor_key(m["gateway"], m["slave_id"])
+            new_drivers[key] = make_hardware_driver(m["driver_type"], client, int(m["slave_id"]))
+    else:
+        for m in cfg.get("motors", []):
+            key = build_motor_key(m["gateway"], m["slave_id"])
+            sim = MotorSim(slave_id=int(m["slave_id"]))
+            new_sims[key] = sim
+            sim.start()
+            new_drivers[key] = make_sim_driver(sim)
+
+    return new_gws, new_drivers, new_sims
+
+
+async def _teardown_runtime():
+    """Stop every in-process simulator and close every open gateway client."""
+    global gateways, drivers, sim_motors
+    for sim in list(sim_motors.values()):
+        try:
+            await sim.stop()
+        except Exception:
+            pass
+    for client in list(gateways.values()):
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    sim_motors = {}
+    gateways = {}
+    drivers = {}
+
+
+async def _reload_runtime():
+    """Atomically replace the running gateways/drivers/sequencer with a fresh
+    set built from the current ``config``. Held by ``_reload_lock`` so two
+    concurrent saves can't race.
+    """
+    global gateways, drivers, sim_motors, sequencer
+    async with _reload_lock:
+        if sequencer is not None:
+            sequencer.cancel()
+        # Cancel any running auto-cycle; its drivers map is about to be replaced.
+        await show.stop_auto()
+        await _teardown_runtime()
+        new_g, new_d, new_s = await _build_runtime(config)
+        gateways = new_g
+        drivers = new_d
+        sim_motors = new_s
+        sequencer = MultiMotorSequencer(drivers=drivers, motor_keys=list(drivers.keys()))
+        # Fresh array → face 1 by convention.
+        await show.set_current_page(1)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global config, modbus, sequencer, sim_motors
+    global config, gateways, drivers, sim_motors, sequencer
     config = load_config()
-
-    from .registers import set_pulses_per_rev
-    set_pulses_per_rev(
-        command_ppr=config["motors"].get("command_ppr", 10000),
-        encoder_ppr=config["motors"].get("encoder_ppr", 10000),
-    )
-
-    ids = _slave_ids()
-    conn = config["connection"]
-    sim_motors = {}
-
-    if conn["mode"] == "hardware":
-        real = RealModbus(
-            port=conn["serial_port"],
-            baudrate=conn["baudrate"],
-            data_bits=conn.get("data_bits", 8),
-            parity=conn.get("parity", "none"),
-            stop_bits=conn.get("stop_bits", 1),
-        )
-        await real.connect()
-        modbus = real
-    elif conn["mode"] == "tcp":
-        tcp = TcpModbus(
-            host=conn.get("tcp_host", "192.168.1.100"),
-            port=conn.get("tcp_port", 502),
-        )
-        await tcp.connect()
-        modbus = tcp
-    else:
-        sim_motors = {sid: MotorSim(slave_id=sid) for sid in ids}
-        modbus = SimulatedModbus(sim_motors)
-        for m in sim_motors.values():
-            m.start()
-
-    sequencer = MultiMotorSequencer(modbus, slave_ids=ids)
+    new_g, new_d, new_s = await _build_runtime(config)
+    gateways = new_g
+    drivers = new_d
+    sim_motors = new_s
+    sequencer = MultiMotorSequencer(drivers=drivers, motor_keys=list(drivers.keys()))
 
     broadcast_task = asyncio.create_task(_broadcast_loop())
     yield
     broadcast_task.cancel()
-    for m in sim_motors.values():
-        await m.stop()
-    if isinstance(modbus, (RealModbus, TcpModbus)):
-        await modbus.disconnect()
+    await _teardown_runtime()
 
 
 app = FastAPI(lifespan=lifespan)
 
 
 def _static_dir() -> Path:
-    """Static asset dir. When frozen, the launcher sets PYSIM_RESOURCE_ROOT to sys._MEIPASS."""
     env = os.environ.get("PYSIM_RESOURCE_ROOT")
     if env:
         return Path(env) / "static"
@@ -100,19 +187,21 @@ def _static_dir() -> Path:
 STATIC_DIR = _static_dir()
 
 
-# --- Pydantic models ---
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
 
 class MoveRequest(BaseModel):
-    slave_id: int = 1
+    motor_key: str
     angle_deg: float = 90.0
     speed_rpm: int = 200
     accel: int = 200
     decel: int = 200
-    mode: str = "relative"  # "absolute" or "relative"
+    mode: str = "relative"
 
 
 class MotorParams(BaseModel):
-    slave_id: int
+    motor_key: str
     angle_deg: float = 90.0
     speed_rpm: int = 200
     accel: int = 200
@@ -125,36 +214,71 @@ class SequenceRequest(BaseModel):
     mode: str = "relative"
 
 
-class AlarmResetRequest(BaseModel):
-    slave_id: int = 1
+class MotorKeyRequest(BaseModel):
+    motor_key: str | None = None       # None / empty → apply to all
 
 
 class HomeRequest(BaseModel):
-    slave_id: int = 0  # 0 = all motors, otherwise a specific slave_id
-    speed_rpm: int = 20      # Homing is safety-sensitive — slow by default.
+    motor_key: str | None = None       # None → all motors
+    speed_rpm: int = 10
     accel: int = 200
     decel: int = 200
 
 
 class JogStartRequest(BaseModel):
-    slave_id: int
-    direction: int = 1  # +1 forward, -1 reverse
+    motor_key: str
+    direction: int = 1
     speed_rpm: int = 60
     accel: int = 200
     decel: int = 200
 
 
-class JogStopRequest(BaseModel):
-    slave_id: int
+class TransitionRequest(BaseModel):
+    """Shared body for /api/show/next, /api/show/prev, /api/show/goto."""
+    effect: str = "simultaneous"
+    speed_rpm: int = DEFAULT_SPEED_RPM
+    accel: int = DEFAULT_ACCEL
+    decel: int = DEFAULT_DECEL
+    step_ms: int = DEFAULT_STEP_MS
+    gap_ms: int = DEFAULT_STEP_MS * 4
+    max_jitter_ms: int = 1500
+    target_page: int | None = None     # only used by /goto
 
 
-# --- Routes ---
+class AutoCycleRequest(BaseModel):
+    hold_s: float = 5.0
+    direction: int = 1                 # +1 forward, -1 backward
+    effect: str = "wave"
+    speed_rpm: int = DEFAULT_SPEED_RPM
+    accel: int = DEFAULT_ACCEL
+    decel: int = DEFAULT_DECEL
+    step_ms: int = DEFAULT_STEP_MS
+    gap_ms: int = DEFAULT_STEP_MS * 4
+    max_jitter_ms: int = 1500
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_targets(motor_key: str | None) -> list[str]:
+    """A None/empty motor_key applies to every configured motor."""
+    if motor_key:
+        return [motor_key] if motor_key in drivers else []
+    return list(drivers.keys())
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/favicon.ico")
 async def favicon():
     from fastapi.responses import Response
-    # 1x1 transparent PNG
-    return Response(content=b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n\xb4\x00\x00\x00\x00IEND\xaeB`\x82', media_type="image/png")
+    return Response(
+        content=b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n\xb4\x00\x00\x00\x00IEND\xaeB`\x82',
+        media_type="image/png",
+    )
 
 
 @app.get("/")
@@ -171,13 +295,10 @@ async def get_status():
 async def move_motor(req: MoveRequest):
     if sequencer.active:
         return {"error": "Sequence in progress"}
-
-    from .registers import PR0_MODE, PR0_TRIGGER, PR0_TRIGGER_VAL, degrees_to_pulses, split_32
-    mode_val = MODE_ABSOLUTE if req.mode == "absolute" else MODE_RELATIVE
-    pulses = degrees_to_pulses(req.angle_deg)
-    pos_h, pos_l = split_32(pulses)
-    await modbus.write_registers(req.slave_id, PR0_MODE, [mode_val, pos_h, pos_l, req.speed_rpm, req.accel, req.decel])
-    await modbus.write_registers(req.slave_id, PR0_TRIGGER, [PR0_TRIGGER_VAL])
+    d = drivers.get(req.motor_key)
+    if d is None:
+        return {"error": f"Unknown motor {req.motor_key!r}"}
+    await d.start_move(req.mode, req.angle_deg, req.speed_rpm, req.accel, req.decel)
     return {"ok": True}
 
 
@@ -187,92 +308,78 @@ async def run_sequence(req: SequenceRequest):
         return {"error": "Sequence already running"}
     if not req.motors:
         return {"error": "No motors in sequence"}
-
-    mode_val = MODE_ABSOLUTE if req.mode == "absolute" else MODE_RELATIVE
     steps = [
         MotorStep(
-            slave_id=m.slave_id,
+            motor_key=m.motor_key,
             angle_deg=m.angle_deg,
             speed_rpm=m.speed_rpm,
             accel=m.accel,
             decel=m.decel,
         )
         for m in req.motors
+        if m.motor_key in drivers
     ]
-    asyncio.create_task(sequencer.run_sequence(steps=steps, delay_s=req.delay_s, mode=mode_val))
+    if not steps:
+        return {"error": "No valid motors in sequence"}
+    asyncio.create_task(sequencer.run_sequence(steps=steps, delay_s=req.delay_s, mode=req.mode))
     return {"ok": True}
 
 
 @app.post("/api/jog/start")
 async def jog_start(req: JogStartRequest):
-    """Begin a jog: issue a large relative move at the requested speed. Stop with /api/jog/stop."""
     if sequencer.active:
         return {"error": "Sequence in progress"}
-
-    from .registers import PR0_MODE, PR0_TRIGGER, PR0_TRIGGER_VAL, degrees_to_pulses, split_32
-
-    # 100 revolutions worth of motion in the requested direction.
-    # The user releases the jog button → /api/jog/stop decelerates before this finishes.
+    d = drivers.get(req.motor_key)
+    if d is None:
+        return {"error": f"Unknown motor {req.motor_key!r}"}
     angle = 36000.0 * (1 if req.direction >= 0 else -1)
-    pulses = degrees_to_pulses(angle)
-    pos_h, pos_l = split_32(pulses)
-    await modbus.write_registers(req.slave_id, PR0_MODE, [
-        MODE_RELATIVE, pos_h, pos_l, req.speed_rpm, req.accel, req.decel,
-    ])
-    await modbus.write_registers(req.slave_id, PR0_TRIGGER, [PR0_TRIGGER_VAL])
+    await d.start_move("relative", angle, req.speed_rpm, req.accel, req.decel)
     return {"ok": True}
 
 
 @app.post("/api/jog/stop")
-async def jog_stop(req: JogStopRequest):
-    """Stop a jogging motor without latching e-stop."""
-    sid = req.slave_id
-    if isinstance(modbus, SimulatedModbus) and sid in modbus.motors:
-        modbus.motors[sid].stop_motion()
-    else:
-        # On real hardware, writing the stop value to ESTOP_REG decelerates the motor.
-        await modbus.write_registers(sid, ESTOP_REG, [ESTOP_VAL])
+async def jog_stop(req: MotorKeyRequest):
+    if not req.motor_key:
+        return {"error": "motor_key required"}
+    d = drivers.get(req.motor_key)
+    if d is None:
+        return {"error": f"Unknown motor {req.motor_key!r}"}
+    await d.stop_motion()
     return {"ok": True}
 
 
 @app.post("/api/home")
 async def home_motor(req: HomeRequest):
-    """Move motor(s) to absolute position 0 (home)."""
     if sequencer.active:
         return {"error": "Sequence in progress"}
-
-    from .registers import PR0_MODE, PR0_TRIGGER, PR0_TRIGGER_VAL, split_32
-
-    targets = _slave_ids() if req.slave_id == 0 else [req.slave_id]
-
-    for sid in targets:
-        # Absolute move to the zero-offset position (user's 0)
-        home_pulses = zero_offsets.get(sid, 0)
-        pos_h, pos_l = split_32(home_pulses)
-        await modbus.write_registers(sid, PR0_MODE, [
-            MODE_ABSOLUTE, pos_h, pos_l, req.speed_rpm, req.accel, req.decel
-        ])
-        await modbus.write_registers(sid, PR0_TRIGGER, [PR0_TRIGGER_VAL])
-
+    from .registers import pulses_to_degrees
+    for key in _resolve_targets(req.motor_key):
+        d = drivers[key]
+        home_pulses = zero_offsets.get(key, 0)
+        await d.start_move(
+            mode="absolute",
+            angle_deg=pulses_to_degrees(home_pulses),
+            speed_rpm=req.speed_rpm,
+            accel=req.accel,
+            decel=req.decel,
+        )
     return {"ok": True}
 
 
 @app.post("/api/set-zero")
-async def set_zero(req: AlarmResetRequest):
-    """Set current position as 0 by storing a software offset."""
-    sid = req.slave_id
-    targets = _slave_ids() if sid == 0 else [sid]
-
-    for t in targets:
-        if isinstance(modbus, SimulatedModbus) and t in modbus.motors:
-            modbus.motors[t].position = 0.0
-            zero_offsets[t] = 0
+async def set_zero(req: MotorKeyRequest):
+    targets = _resolve_targets(req.motor_key)
+    for key in targets:
+        d = drivers[key]
+        if key in sim_motors:
+            sim_motors[key].position = 0.0
+            zero_offsets[key] = 0
         else:
-            # Read current raw position and store as offset
-            pos_regs = await modbus.read_holding_registers(t, FEEDBACK_POS_H, 2)
-            raw_pulses = join_32_signed(pos_regs[0], pos_regs[1])
-            zero_offsets[t] = raw_pulses
-
+            st = await d.read_status()
+            zero_offsets[key] = int(st.get("position_pulses", 0))
+    # If the user zero'd every motor at once, the array is now aligned to face 1.
+    if not req.motor_key:
+        await show.set_current_page(1)
     return {"ok": True}
 
 
@@ -283,103 +390,158 @@ async def estop():
 
 
 @app.post("/api/alarm-reset")
-async def alarm_reset(req: AlarmResetRequest):
-    await modbus.write_registers(req.slave_id, SYSTEM_CMD_REG, [ALARM_RESET_VAL])
+async def alarm_reset(req: MotorKeyRequest):
+    for key in _resolve_targets(req.motor_key):
+        await drivers[key].alarm_reset()
     return {"ok": True}
 
 
 @app.post("/api/save")
 async def save_params():
-    for sid in _slave_ids():
-        await modbus.write_registers(sid, SYSTEM_CMD_REG, [PERM_SAVE_VAL])
+    for d in drivers.values():
+        try:
+            await d.save_params()
+        except Exception:
+            pass
     return {"ok": True}
 
 
 @app.post("/api/enable")
-async def enable_motors():
-    from .registers import SW_ENABLE_REG, SW_ENABLE_VAL
-    for sid in _slave_ids():
-        await modbus.write_registers(sid, SW_ENABLE_REG, [SW_ENABLE_VAL])
+async def enable_motors(req: MotorKeyRequest = MotorKeyRequest()):
+    for key in _resolve_targets(req.motor_key):
+        await drivers[key].enable()
     return {"ok": True}
 
 
 @app.post("/api/disable")
-async def disable_motors():
-    from .registers import SW_ENABLE_REG
-    for sid in _slave_ids():
-        await modbus.write_registers(sid, SW_ENABLE_REG, [0])
+async def disable_motors(req: MotorKeyRequest = MotorKeyRequest()):
+    for key in _resolve_targets(req.motor_key):
+        await drivers[key].disable()
     return {"ok": True}
 
 
-@app.get("/api/ports")
-async def list_serial_ports():
-    """Detect available serial ports on the system.
+# ---------------------------------------------------------------------------
+# Inventory / setup endpoints
+# ---------------------------------------------------------------------------
 
-    On macOS we deliberately drop /dev/tty.* entries — the tty interface blocks
-    waiting for a hardware DCD signal that USB-RS485 adapters don't provide, so
-    opening it just hangs or errors. /dev/cu.* is the correct non-blocking dial-out
-    interface for serial bridges.
+@app.get("/api/driver-types")
+async def driver_catalog():
+    return {
+        "types": [{"key": k, **v} for k, v in DRIVER_CATALOG.items()],
+        "default": DEFAULT_DRIVER_TYPE,
+        "allowed": list(ALLOWED_DRIVER_TYPES),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trivision / triangular-prism show endpoints
+# ---------------------------------------------------------------------------
+
+def _opts_from(req: TransitionRequest | AutoCycleRequest) -> TransitionOptions:
+    return TransitionOptions(
+        effect=req.effect,
+        speed_rpm=int(req.speed_rpm),
+        accel=int(req.accel),
+        decel=int(req.decel),
+        step_ms=int(req.step_ms),
+        gap_ms=int(req.gap_ms),
+        max_jitter_ms=int(req.max_jitter_ms),
+    )
+
+
+@app.get("/api/show/effects")
+async def show_effects():
+    return {"effects": effects_catalog()}
+
+
+@app.get("/api/show/state")
+async def show_state():
+    return show.state()
+
+
+@app.post("/api/show/next")
+async def show_next(req: TransitionRequest = TransitionRequest()):
+    if sequencer is not None and sequencer.active:
+        return {"error": "Sequence in progress"}
+    await show.next_page(drivers, _opts_from(req))
+    return {"ok": True, **show.state()}
+
+
+@app.post("/api/show/prev")
+async def show_prev(req: TransitionRequest = TransitionRequest()):
+    if sequencer is not None and sequencer.active:
+        return {"error": "Sequence in progress"}
+    await show.prev_page(drivers, _opts_from(req))
+    return {"ok": True, **show.state()}
+
+
+@app.post("/api/show/goto")
+async def show_goto(req: TransitionRequest):
+    if sequencer is not None and sequencer.active:
+        return {"error": "Sequence in progress"}
+    if req.target_page is None:
+        return {"error": "target_page required"}
+    await show.goto(drivers, int(req.target_page), _opts_from(req))
+    return {"ok": True, **show.state()}
+
+
+@app.post("/api/show/set-current-page")
+async def show_set_current_page(req: TransitionRequest):
+    """Tell the show controller what page the array is currently on, without
+    moving any motors. Use after a manual realignment / Set Zero so the next
+    'Next' lands on the right face.
     """
-    import glob as g
-    import sys
-    ports = []
-    if sys.platform.startswith("darwin"):
-        ports = g.glob("/dev/cu.*")
-    elif sys.platform.startswith("linux"):
-        ports = g.glob("/dev/ttyUSB*") + g.glob("/dev/ttyACM*") + g.glob("/dev/ttyS*")
-    elif sys.platform.startswith("win"):
-        ports = [f"COM{i}" for i in range(1, 20)]
-    ports.sort()
-    return {"ports": ports}
+    if req.target_page is None:
+        return {"error": "target_page required"}
+    await show.set_current_page(int(req.target_page))
+    return {"ok": True, **show.state()}
+
+
+@app.post("/api/show/auto/start")
+async def show_auto_start(req: AutoCycleRequest):
+    await show.start_auto(drivers, req.hold_s, req.direction, _opts_from(req))
+    return {"ok": True, **show.state()}
+
+
+@app.post("/api/show/auto/stop")
+async def show_auto_stop():
+    await show.stop_auto()
+    return {"ok": True, **show.state()}
+
+
+@app.get("/api/limits")
+async def limits():
+    return {
+        "max_gateways": MAX_GATEWAYS,
+        "max_motors_per_gateway": MAX_MOTORS_PER_GATEWAY,
+        "max_total_motors": MAX_TOTAL_MOTORS,
+    }
 
 
 @app.post("/api/test-connection")
 async def test_connection():
-    """Ping every configured motor via the *currently active* connection.
+    """Ping every configured motor via its currently active driver."""
+    results = []
+    for key, d in drivers.items():
+        r = await d.test_connection()
+        r["motor_key"] = key
+        r["label"] = _label_for(key)
+        results.append(r)
+    all_ok = bool(results) and all(r["ok"] for r in results)
+    return {"ok": all_ok, "motors": results}
 
-    We deliberately reuse the live modbus client (built in lifespan()) instead
-    of opening a fresh one. Two clients can't share the same serial port, so a
-    fresh client would always fail with "Cannot open" while the server is up.
-    The trade-off: this tests the running connection, not the in-form values —
-    so changes need to be saved and the server restarted before the test
-    reflects them. The UI already communicates that with "restart required".
-    """
-    ids = _slave_ids()
 
-    if isinstance(modbus, SimulatedModbus):
-        return {"ok": True, "motors": [
-            {"ok": True, "slave_id": sid, "status": 0} for sid in ids
-        ]}
-
-    if not isinstance(modbus, (RealModbus, TcpModbus)):
-        return {"ok": False, "error": "No active modbus client"}
-
+@app.get("/api/debug/{motor_key}")
+async def debug_status(motor_key: str):
+    d = drivers.get(motor_key)
+    if d is None:
+        return {"error": f"Unknown motor {motor_key!r}"}
     try:
-        results = [await modbus.test_connection(sid) for sid in ids]
-        all_ok = all(r["ok"] for r in results)
-        return {"ok": all_ok, "motors": results}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-@app.get("/api/debug/{slave_id}")
-async def debug_registers(slave_id: int):
-    """Read raw register values for debugging."""
-    try:
-        status = await modbus.read_holding_registers(slave_id, MOTION_STATUS, 1)
-        pos = await modbus.read_holding_registers(slave_id, FEEDBACK_POS_H, 2)
-        vel = await modbus.read_holding_registers(slave_id, FEEDBACK_VEL_H, 2)
-        alarm = await modbus.read_holding_registers(slave_id, CURRENT_ALARM, 1)
+        st = await d.read_status()
         return {
-            "status_raw": f"0x{status[0]:04X}",
-            "pos_high": f"0x{pos[0]:04X}",
-            "pos_low": f"0x{pos[1]:04X}",
-            "pos_joined": join_32_signed(pos[0], pos[1]),
-            "vel_high": f"0x{vel[0]:04X}",
-            "vel_low": f"0x{vel[1]:04X}",
-            "vel_joined_32": join_32(vel[0], vel[1]),
-            "vel_low_only": vel[1],
-            "alarm": f"0x{alarm[0]:04X}",
+            "label": _label_for(motor_key),
+            "driver_type": driver_type_for(config, *motor_key.rsplit(".", 1)) if "." in motor_key else DEFAULT_DRIVER_TYPE,
+            **st,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -387,29 +549,42 @@ async def debug_registers(slave_id: int):
 
 @app.get("/api/config")
 async def get_config():
-    return {**config, "max_motors": MAX_MOTORS}
+    return {
+        **config,
+        "limits": {
+            "max_gateways": MAX_GATEWAYS,
+            "max_motors_per_gateway": MAX_MOTORS_PER_GATEWAY,
+            "max_total_motors": MAX_TOTAL_MOTORS,
+        },
+        "allowed_driver_types": list(ALLOWED_DRIVER_TYPES),
+    }
 
 
 @app.post("/api/config")
 async def update_config(new_cfg: dict):
+    """Replace top-level sections with the values supplied, persist, and apply.
+
+    After saving, the running gateways / drivers / sequencer are torn down and
+    rebuilt in place — no process restart needed. The only setting that still
+    can't be hot-applied is the web server's bind host/port, since uvicorn
+    holds the socket; restart the launcher for those.
+    """
     global config
-    # Merge into current config
-    for section in ["connection", "motors", "server"]:
+    for section in ("mode", "gateways", "motors", "motor_defaults", "server", "connection"):
         if section in new_cfg:
-            config.setdefault(section, {}).update(new_cfg[section])
-
-    # On macOS, normalize /dev/tty.usb* → /dev/cu.usb*. The tty interface blocks
-    # on DCD and never works for USB-RS485 adapters; users shouldn't have to know
-    # this. (Harmless on Linux/Windows since paths don't match the prefix.)
-    sp = config.get("connection", {}).get("serial_port", "")
-    if sp.startswith("/dev/tty.usb"):
-        config["connection"]["serial_port"] = sp.replace("/dev/tty.", "/dev/cu.", 1)
-
+            config[section] = new_cfg[section]
     save_config(config)
-    return {"ok": True, "config": config, "restart_required": True}
+    config = load_config()
+    try:
+        await _reload_runtime()
+        return {"ok": True, "config": config, "applied": True}
+    except Exception as e:
+        return {"ok": True, "config": config, "applied": False, "reload_error": str(e)}
 
 
-# --- WebSocket ---
+# ---------------------------------------------------------------------------
+# WebSocket
+# ---------------------------------------------------------------------------
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -417,23 +592,22 @@ async def websocket_endpoint(ws: WebSocket):
     ws_clients.add(ws)
     try:
         while True:
-            await ws.receive_text()  # keep connection alive
+            await ws.receive_text()
     except WebSocketDisconnect:
         ws_clients.discard(ws)
 
 
 async def _broadcast_loop():
-    """Push status to all WebSocket clients. 10Hz for sim, 4Hz for hardware."""
-    is_hw = isinstance(modbus, (RealModbus, TcpModbus))
-    interval = 0.25 if is_hw else 0.1  # hardware needs more time per poll cycle
     while True:
+        # Recompute each tick so a sim↔tcp hot-swap takes effect immediately.
+        interval = 0.25 if config.get("mode") == "tcp" else 0.1
         await asyncio.sleep(interval)
         if not ws_clients:
             continue
         try:
             data = await _build_status()
         except Exception:
-            continue  # skip this cycle on read error
+            continue
         dead = []
         for ws in ws_clients:
             try:
@@ -445,57 +619,50 @@ async def _broadcast_loop():
 
 
 async def _build_status() -> dict:
-    """Read motor registers and build status dict."""
-    from .registers import STATUS_RUNNING, STATUS_CMD_OK, STATUS_PATH_OK
-    ids = _slave_ids()
-    result = {
-        "slave_ids": ids,
-        "motors": {},
-        "sequence": {"phase": sequencer.phase, "active": sequencer.active, "error": sequencer.error},
-    }
+    """Read live status for every driver and emit a flat motor-keyed dict."""
+    from .registers import pulses_to_degrees
+    motors_out: dict[str, dict] = {}
+    inventory: list[dict] = []
 
-    for sid in ids:
-        try:
-            status_regs = await modbus.read_holding_registers(sid, MOTION_STATUS, 1)
-            pos_regs = await modbus.read_holding_registers(sid, FEEDBACK_POS_H, 2)
-            vel_regs = await modbus.read_holding_registers(sid, FEEDBACK_VEL_H, 2)
-            alarm_regs = await modbus.read_holding_registers(sid, CURRENT_ALARM, 1)
-        except Exception:
-            # Motor not responding — show zeroed/disconnected state
-            result["motors"][str(sid)] = {
+    for spec in _motor_specs():
+        key = build_motor_key(spec["gateway"], spec["slave_id"])
+        label = motor_label(spec["gateway"], spec["slave_id"])
+        inventory.append({
+            "motor_key": key,
+            "label": label,
+            "gateway": spec["gateway"],
+            "slave_id": int(spec["slave_id"]),
+            "driver_type": spec["driver_type"],
+        })
+        d = drivers.get(key)
+        if d is None:
+            motors_out[key] = {
                 "position_deg": 0.0, "position_pulses": 0, "velocity_rpm": 0,
                 "running": False, "enabled": False, "estopped": False,
                 "alarm": 0, "status_bits": 0, "offline": True,
             }
             continue
 
-        # Position is signed (negative for reverse rotation), subtract software zero offset
-        raw_pulses = join_32_signed(pos_regs[0], pos_regs[1])
-        pos_pulses = raw_pulses - zero_offsets.get(sid, 0)
-        status = status_regs[0]
-
-        # Velocity: high register (0x1046) returns 0xFFFF when idle/invalid
-        # Use only the low register (0x1047) which holds the actual RPM value
-        vel_rpm = vel_regs[1] if vel_regs[0] == 0xFFFF else join_32(vel_regs[0], vel_regs[1])
-
-        if isinstance(modbus, SimulatedModbus):
-            motor = modbus.motors[sid]
-            running = motor.running
-            enabled = motor.enabled
-            estopped = motor.estopped
+        st = await d.read_status()
+        if not st.get("offline"):
+            raw_pulses = int(st.get("position_pulses", 0))
+            display_pulses = raw_pulses - zero_offsets.get(key, 0)
+            st["position_pulses"] = display_pulses
+            st["position_deg"] = round(pulses_to_degrees(display_pulses), 2)
+            st["current_face"] = face_for_position(st["position_deg"])
         else:
-            running = bool(status & STATUS_RUNNING)
-            enabled = bool(status & (STATUS_CMD_OK | STATUS_PATH_OK | STATUS_RUNNING))
-            estopped = False
+            st["current_face"] = None
+        motors_out[key] = dict(st)
 
-        result["motors"][str(sid)] = {
-            "position_deg": round(pulses_to_degrees(pos_pulses), 2),
-            "position_pulses": pos_pulses,
-            "velocity_rpm": vel_rpm,
-            "running": running,
-            "enabled": enabled,
-            "estopped": estopped,
-            "alarm": alarm_regs[0],
-            "status_bits": status,
-        }
-    return result
+    seq_info = (
+        {"phase": sequencer.phase, "active": sequencer.active, "error": sequencer.error}
+        if sequencer is not None else
+        {"phase": "idle", "active": False, "error": None}
+    )
+    return {
+        "mode": config.get("mode"),
+        "motors": motors_out,
+        "inventory": inventory,
+        "sequence": seq_info,
+        "show": show.state(),
+    }
