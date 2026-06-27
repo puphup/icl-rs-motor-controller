@@ -41,6 +41,21 @@ DRIVER_CATALOG: dict[str, dict] = {
     "tl_r":   {"label": "TL-R series (RS485 Integrated)"},
 }
 
+# Per-driver-type pulses-per-rev. These are hardware-model constants: the
+# iCL-RS takes 10000 command pulses/rev (Pr0.01) and reports a 65536-count
+# encoder; the TL-R takes/reports 4000 (PA_101). A single global PPR can't
+# serve a mixed bus, so each driver carries its own. ponytail: calibration
+# knob — re-measure and edit here if a drive is configured differently.
+DRIVER_PPR: dict[str, dict] = {
+    "icl_rs": {"command_ppr": 10000, "encoder_ppr": 65536},
+    # TL-R: measured empirically (PA_101's 4000 is wrong for these registers).
+    # With the clean low→high move trigger, target pulses map 1:1 to encoder
+    # counts, and the encoder is ~1000 counts/rev (jog 30rpm×20s → 9928 counts
+    # over 10 revs). So 1000/1000: command 120° → 333 pulses → 333 counts → 120°
+    # physical, and the UI reads it back as 120°.
+    "tl_r":   {"command_ppr": 1000,  "encoder_ppr": 1000},
+}
+
 
 def make_hardware_driver(
     driver_type: str,
@@ -49,10 +64,11 @@ def make_hardware_driver(
 ) -> MotorDriver:
     """Build a hardware driver of the given type for one motor."""
     key = (driver_type or "icl_rs").lower()
+    ppr = DRIVER_PPR.get(key, {"command_ppr": 10000, "encoder_ppr": 10000})
     if key == "icl_rs":
-        return ICLRSDriver(modbus, slave_id)
+        return ICLRSDriver(modbus, slave_id, **ppr)
     if key == "tl_r":
-        return TLRDriver(modbus, slave_id)
+        return TLRDriver(modbus, slave_id, **ppr)
     raise ValueError(f"Unknown driver type: {driver_type!r}")
 
 

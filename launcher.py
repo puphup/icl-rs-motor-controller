@@ -40,7 +40,7 @@ os.environ.setdefault("PYSIM_CONFIG_DIR", str(_writable_root()))
 # the static analyzer can't trace dynamic string imports, so we must reference the
 # module explicitly here for it to get pulled in.
 from app.config import load_config  # noqa: E402
-from app.server import app as fastapi_app  # noqa: E402
+from app.server import app as fastapi_app, run_iclrs_setup  # noqa: E402
 
 
 def _open_browser_when_ready(url: str, delay: float = 1.5) -> None:
@@ -55,6 +55,24 @@ def _open_browser_when_ready(url: str, delay: float = 1.5) -> None:
 
 
 def main() -> None:
+    import argparse, asyncio
+    p = argparse.ArgumentParser(prog="iCL-RS Controller")
+    p.add_argument(
+        "--setup-iclrs-enable",
+        action="store_true",
+        help="One-time iCL-RS commissioning: switch DI1 (Pr4.02) from "
+             "Normally-Closed Enable to 'invalid' and persist to EEPROM "
+             "so software (Pr0.07) actually controls enable. Skips the "
+             "normal web-server launch. iCL-RS drives only; other "
+             "motor types in the config are untouched.",
+    )
+    args = p.parse_args()
+
+    if args.setup_iclrs_enable:
+        touched = asyncio.run(run_iclrs_setup())
+        print(f"[setup] reconfigured {touched} iCL-RS drive(s)")
+        return
+
     cfg = load_config()
     host = cfg["server"]["host"]
     port = cfg["server"]["port"]

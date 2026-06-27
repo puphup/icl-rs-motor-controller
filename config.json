@@ -191,81 +191,81 @@
       "driver_type": "icl_rs"
     },
     {
-      "gateway": "gw2",
-      "slave_id": 17,
-      "driver_type": "icl_rs"
-    },
-    {
-      "gateway": "gw2",
-      "slave_id": 18,
-      "driver_type": "icl_rs"
-    },
-    {
-      "gateway": "gw2",
-      "slave_id": 19,
-      "driver_type": "icl_rs"
-    },
-    {
-      "gateway": "gw2",
-      "slave_id": 20,
-      "driver_type": "icl_rs"
-    },
-    {
       "gateway": "gw3",
       "slave_id": 1,
-      "driver_type": "icl_rs"
+      "driver_type": "tl_r"
     },
     {
       "gateway": "gw3",
       "slave_id": 2,
-      "driver_type": "icl_rs"
+      "driver_type": "tl_r"
     },
     {
       "gateway": "gw3",
       "slave_id": 3,
-      "driver_type": "icl_rs"
+      "driver_type": "tl_r"
     },
     {
       "gateway": "gw3",
       "slave_id": 4,
-      "driver_type": "icl_rs"
+      "driver_type": "tl_r"
     },
     {
       "gateway": "gw3",
       "slave_id": 5,
-      "driver_type": "icl_rs"
+      "driver_type": "tl_r"
     },
     {
       "gateway": "gw3",
       "slave_id": 6,
-      "driver_type": "icl_rs"
+      "driver_type": "tl_r"
     },
     {
       "gateway": "gw3",
       "slave_id": 7,
-      "driver_type": "icl_rs"
+      "driver_type": "tl_r"
     },
     {
       "gateway": "gw3",
       "slave_id": 8,
-      "driver_type": "icl_rs"
+      "driver_type": "tl_r"
     },
     {
       "gateway": "gw3",
       "slave_id": 9,
-      "driver_type": "icl_rs"
+      "driver_type": "tl_r"
     },
     {
       "gateway": "gw3",
       "slave_id": 10,
-      "driver_type": "icl_rs"
+      "driver_type": "tl_r"
+    },
+    {
+      "gateway": "gw3",
+      "slave_id": 11,
+      "driver_type": "tl_r"
+    },
+    {
+      "gateway": "gw3",
+      "slave_id": 12,
+      "driver_type": "tl_r"
+    },
+    {
+      "gateway": "gw3",
+      "slave_id": 13,
+      "driver_type": "tl_r"
+    },
+    {
+      "gateway": "gw3",
+      "slave_id": 14,
+      "driver_type": "tl_r"
     }
   ],
   "server": {
     "host": "0.0.0.0",
     "port": 8000
   },
-  "mode": "simulation",
+  "mode": "tcp",
   "gateways": [
     {
       "id": "gw1",
@@ -284,7 +284,7 @@
     }
   ],
   "motor_defaults": {
-    "command_ppr": 4000,
-    "encoder_ppr": 4000
+    "command_ppr": 10000,
+    "encoder_ppr": 65536
   }
 }

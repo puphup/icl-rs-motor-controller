@@ -35,10 +35,10 @@ def face_for_position(position_deg: float) -> int:
         return 1
     idx = round(position_deg / PAGE_STEP_DEG) % 3
     return int(idx) + 1
-DEFAULT_SPEED_RPM = 60
-DEFAULT_ACCEL = 200
-DEFAULT_DECEL = 200
-DEFAULT_STEP_MS = 100              # per-motor delay for wave-style effects
+DEFAULT_SPEED_RPM = 5              # Trivision moves look smooth at low rpm
+DEFAULT_ACCEL = 500                # gentler ramp so the motors don't snap
+DEFAULT_DECEL = 900                # longer decel = smoother stop (still <= 2000)
+DEFAULT_STEP_MS = 200              # per-motor delay for wave-style effects
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +139,12 @@ class TransitionOptions:
     step_ms: int = DEFAULT_STEP_MS
     gap_ms: int = DEFAULT_STEP_MS * 4
     max_jitter_ms: int = 1500
+    # Two-phase rotation: do the last `soft_stop_deg` of every transition at
+    # `soft_stop_speed_rpm` so the array eases into its target face instead of
+    # the drive's position loop hunting at full speed. Set soft_stop_deg=0 to
+    # disable.
+    soft_stop_deg: float = 0.0
+    soft_stop_speed_rpm: int = 0
 
 
 @dataclass
@@ -271,18 +277,38 @@ class ShowController:
                 pass
         await asyncio.gather(*(_arm(k) for k, _ in schedule))
 
-        async def one(motor_key: str, delay_ms: int):
+        # Two-phase start for tight synchronization:
+        #   1) STAGE every motor's target/speed/accel up front (the slow part —
+        #      5-6 register writes each). Staging is concurrent across gateways
+        #      and serialized per-bus, but order/timing here doesn't matter
+        #      because nothing is moving yet.
+        #   2) TRIGGER each motor — a single tiny write — on its effect schedule.
+        #      For the 'simultaneous' effect every delay is 0, so all triggers
+        #      fire back-to-back and the array starts within a few ms per bus.
+        #      Staggered effects (wave, etc.) just delay the trigger, which is
+        #      now cheap and precise since staging is already done.
+        async def _stage(motor_key: str):
+            d = drivers.get(motor_key)
+            if d is None:
+                return
+            try:
+                await d.stage_move("relative", angle_deg, opts.speed_rpm,
+                                   opts.accel, opts.decel)
+            except Exception:
+                pass
+        await asyncio.gather(*(_stage(k) for k, _ in schedule))
+
+        async def _trigger(motor_key: str, delay_ms: int):
             if delay_ms > 0:
                 await asyncio.sleep(delay_ms / 1000.0)
             d = drivers.get(motor_key)
             if d is None:
                 return
             try:
-                await d.start_move("relative", angle_deg, opts.speed_rpm, opts.accel, opts.decel)
+                await d.trigger_move()
             except Exception:
-                pass     # one bad motor shouldn't kill the whole transition
-
-        await asyncio.gather(*(one(k, dly) for k, dly in schedule))
+                pass
+        await asyncio.gather(*(_trigger(k, dly) for k, dly in schedule))
 
     async def _auto_loop(self, drivers: dict[str, MotorDriver]):
         try:

@@ -17,6 +17,11 @@ class SimDriver(MotorDriver):
     def __init__(self, motor: MotorSim):
         self.motor = motor
         self.slave_id = motor.slave_id
+        # Sim runs one config at a time; mirror the global PPR so the base
+        # pulses_to_deg helper (used by the server) matches the simulator.
+        from .. import registers
+        self.command_ppr = registers.COMMAND_PPR
+        self.encoder_ppr = registers.ENCODER_PPR
 
     async def enable(self) -> None:
         self.motor.enable()
@@ -42,6 +47,10 @@ class SimDriver(MotorDriver):
     async def save_params(self) -> None:
         # No-op in sim; real drives persist to NVRAM.
         return
+
+    async def set_home(self) -> None:
+        # Make the current sim position the origin.
+        self.motor.position = 0.0
 
     async def read_status(self) -> MotorStatus:
         status = self.motor.status_word

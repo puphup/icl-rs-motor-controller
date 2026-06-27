@@ -81,6 +81,7 @@
 
   /* --- Forms ------------------------------------------------------------- */
   label { font-size: 0.65rem; color: var(--text-dim); display: block; margin-bottom: 3px; }
+  label .hint { color: var(--text-dimmer); font-weight: 400; margin-left: 4px; }
   input, select {
     width: 100%; padding: 5px 8px; background: var(--surface2); border: 1px solid var(--border);
     border-radius: 5px; color: var(--text); font-family: inherit; font-size: 0.78rem;
@@ -162,6 +163,16 @@
     position: relative;
   }
   .tile:hover { background: var(--surface3); }
+  /* Gateway colour band on the left edge — quick visual grouping in the grid. */
+  .tile { border-left-width: 3px; }
+  .tile[data-gw="gw1"] { border-left-color: #5b8def; }   /* blue   */
+  .tile[data-gw="gw2"] { border-left-color: #34d399; }   /* green  */
+  .tile[data-gw="gw3"] { border-left-color: #f59e0b; }   /* orange */
+  .tile[data-gw="gw4"] { border-left-color: #a78bfa; }   /* purple */
+  .tile[data-gw="gw5"] { border-left-color: #f43f5e; }   /* rose   */
+  .tile[data-gw="gw6"] { border-left-color: #14b8a6; }   /* teal   */
+  .tile[data-gw="gw7"] { border-left-color: #fbbf24; }   /* amber  */
+  .tile[data-gw="gw8"] { border-left-color: #ec4899; }   /* pink   */
   .tile.selected {
     border-color: var(--accent);
     background: var(--surface3);
@@ -342,7 +353,8 @@
       <button type="button" class="btn-danger btn-lg" onclick="doEstop()">EMERGENCY STOP</button>
       <button type="button" id="btn-enable-all" class="btn-primary" onclick="doToggleEnableAll()">Enable All</button>
       <button type="button" onclick="doHomeAll()">Home All</button>
-      <button type="button" onclick="doZeroAll()">Zero All</button>
+      <button type="button" onclick="doZeroAll()" title="Software display offset only (not saved to drives)">Zero All</button>
+      <button type="button" onclick="doSetHomeAll()" title="Make current position the drive origin, saved to EEPROM (survives power-cycle). Resets show to face 1.">Set Home All</button>
       <button type="button" onclick="doSave()">Save Params</button>
       <span class="spacer"></span>
       <span class="counter" id="online-count">0/0 online</span>
@@ -372,16 +384,24 @@
           <select id="show-effect"></select>
         </div>
         <div class="field">
-          <label for="show-speed">Speed (rpm)</label>
-          <input type="number" id="show-speed" value="60">
+          <label for="show-speed">Speed (rpm) <span class="hint">1…40</span></label>
+          <input type="number" id="show-speed" value="5" min="1" max="40">
         </div>
         <div class="field">
-          <label for="show-step">Step (ms)</label>
-          <input type="number" id="show-step" value="100" title="Per-motor delay for wave / center-out / alternate / edges-in.">
+          <label for="show-step">Step (ms) <span class="hint">0…2000</span></label>
+          <input type="number" id="show-step" value="200" min="0" max="2000" title="Per-motor delay for wave / center-out / alternate / edges-in.">
         </div>
         <div class="field">
-          <label for="show-jitter">Max jitter (ms)</label>
-          <input type="number" id="show-jitter" value="1500" title="Used by the Random effect.">
+          <label for="show-jitter">Max jitter (ms) <span class="hint">0…5000</span></label>
+          <input type="number" id="show-jitter" value="1500" min="0" max="5000" title="Used by the Random effect.">
+        </div>
+        <div class="field">
+          <label for="show-accel">Accel ms <span class="hint">0…2000</span></label>
+          <input type="number" id="show-accel" value="500" min="0" max="2000">
+        </div>
+        <div class="field">
+          <label for="show-decel">Decel ms <span class="hint">0…2000</span></label>
+          <input type="number" id="show-decel" value="900" min="0" max="2000">
         </div>
       </div>
 
@@ -422,12 +442,12 @@
         <div class="focus-section">
           <h3>Move</h3>
           <div class="field-row">
-            <div class="field"><label for="mv-angle">Angle °</label><input type="number" id="mv-angle" value="90"></div>
-            <div class="field"><label for="mv-speed">rpm</label><input type="number" id="mv-speed" value="60"></div>
+            <div class="field"><label for="mv-angle">Angle ° <span class="hint">-3600…3600</span></label><input type="number" id="mv-angle" value="120" min="-3600" max="3600"></div>
+            <div class="field"><label for="mv-speed">rpm <span class="hint">1…40</span></label><input type="number" id="mv-speed" value="15" min="1" max="40"></div>
           </div>
           <div class="field-row">
-            <div class="field"><label for="mv-accel">Accel</label><input type="number" id="mv-accel" value="200"></div>
-            <div class="field"><label for="mv-decel">Decel</label><input type="number" id="mv-decel" value="200"></div>
+            <div class="field"><label for="mv-accel">Accel ms <span class="hint">0…2000</span></label><input type="number" id="mv-accel" value="500" min="0" max="2000"></div>
+            <div class="field"><label for="mv-decel">Decel ms <span class="hint">0…2000</span></label><input type="number" id="mv-decel" value="500" min="0" max="2000"></div>
           </div>
           <div class="field"><label for="mv-mode">Mode</label>
             <select id="mv-mode"><option value="relative">Relative</option><option value="absolute">Absolute</option></select>
@@ -437,7 +457,7 @@
 
         <div class="focus-section">
           <h3>Jog (hold)</h3>
-          <div class="field"><label for="mv-jog-speed">Jog rpm</label><input type="number" id="mv-jog-speed" value="60"></div>
+          <div class="field"><label for="mv-jog-speed">Jog rpm <span class="hint">1…40</span></label><input type="number" id="mv-jog-speed" value="15" min="1" max="40"></div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
             <button type="button"
               onmousedown="startJog(-1)" onmouseup="stopJog()" onmouseleave="stopJog()"
@@ -455,7 +475,8 @@
             <button type="button" onclick="doEnable()">Enable</button>
             <button type="button" onclick="doDisable()">Disable</button>
             <button type="button" onclick="doHome()">Home</button>
-            <button type="button" onclick="doSetZero()">Set Zero</button>
+            <button type="button" onclick="doSetZero()" title="Software display offset only">Set Zero</button>
+            <button type="button" onclick="doSetHome()" title="Store current position as drive origin, saved to EEPROM">Set Home</button>
             <button type="button" class="btn-warning" onclick="doAlarmReset()">Reset Alarm</button>
           </div>
         </div>
@@ -671,6 +692,9 @@ function updateEnableAllButton(d) {
   btn.className = anyEnabled ? 'btn-ghost' : 'btn-primary';
 }
 
+// ponytail: rebuild DOM only when the inventory (or filter) changes; on every
+// other tick patch values in place — otherwise the 4 Hz WS feed kills hover and
+// eats clicks.
 function renderMotorGrid(d) {
   const grid = V('motor-grid');
   const inv = d.inventory || [];
@@ -681,42 +705,55 @@ function renderMotorGrid(d) {
   V('motor-grid-empty').hidden = inv.length > 0;
   V('grid-count').textContent = `${filtered.length} visible`;
 
-  const targetPage = (d.show && d.show.current_page) || null;
-  grid.innerHTML = filtered.map(it => {
-    const m = d.motors[it.motor_key] || {};
-    const offline = m.offline ? ' offline' : '';
-    const selected = (it.motor_key === selectedKey) ? ' selected' : '';
-    const pos = (m.position_deg != null) ? `${m.position_deg.toFixed(1)}°` : '—';
-    const vel = (m.velocity_rpm != null) ? `${m.velocity_rpm} rpm` : '';
-    const enDot = m.enabled ? ' on' : '';
-    const runDot = m.running ? ' run' : '';
-    const alarmDot = m.alarm ? ' alarm' : '';
-    const face = m.current_face;
-    const faceHtml = (face)
-      ? `<span class="face-badge f${face}" title="Currently displaying face ${face}">F${face}</span>`
-      : `<span class="face-badge" title="Face unknown">F?</span>`;
-    // Halo a tile when its physical face matches the show controller's target
-    // page → quick visual scan of which motors are in sync with the array.
-    const halo = (targetPage && face && face === targetPage) ? ' face-target' : '';
-    return `
-      <div class="tile${offline}${selected}${halo}" data-key="${it.motor_key}" onclick="selectMotor('${it.motor_key}')" title="${it.motor_key}">
+  // Build the tile skeleton if filter/inventory shape changed
+  const sig = filter + '|' + filtered.map(it => it.motor_key).join(',');
+  if (grid.dataset.sig !== sig) {
+    grid.dataset.sig = sig;
+    grid.innerHTML = filtered.map(it => `
+      <div class="tile" data-key="${it.motor_key}" data-gw="${it.gateway}" onclick="selectMotor('${it.motor_key}')" title="${it.motor_key}">
         <div class="t-head">
           <span class="t-name">${it.label}</span>
           <span class="t-type">${it.driver_type}</span>
         </div>
-        <div class="t-pos">${pos}</div>
-        <div class="t-vel">${vel}</div>
+        <div class="t-pos" data-role="pos">—</div>
+        <div class="t-vel" data-role="vel"></div>
         <div class="t-foot">
-          ${faceHtml}
+          <span class="face-badge" data-role="face" title="">F?</span>
           <div class="t-dots">
-            <span class="dot${enDot}" title="enabled"></span>
-            <span class="dot${runDot}" title="running"></span>
-            <span class="dot${alarmDot}" title="alarm"></span>
+            <span class="dot" data-role="en"    title="enabled"></span>
+            <span class="dot" data-role="run"   title="running"></span>
+            <span class="dot" data-role="alarm" title="alarm"></span>
           </div>
         </div>
       </div>
-    `;
-  }).join('');
+    `).join('');
+  }
+
+  // Patch each tile's mutable bits
+  const targetPage = (d.show && d.show.current_page) || null;
+  for (const it of filtered) {
+    const tile = grid.querySelector(`.tile[data-key="${it.motor_key}"]`);
+    if (!tile) continue;
+    const m = d.motors[it.motor_key] || {};
+    tile.classList.toggle('offline',     !!m.offline);
+    tile.classList.toggle('selected',    it.motor_key === selectedKey);
+    const face = m.current_face;
+    tile.classList.toggle('face-target', !!(targetPage && face && face === targetPage));
+
+    tile.querySelector('[data-role="pos"]').textContent =
+      (m.position_deg != null) ? `${m.position_deg.toFixed(1)}°` : '—';
+    tile.querySelector('[data-role="vel"]').textContent =
+      (m.velocity_rpm != null) ? `${m.velocity_rpm} rpm` : '';
+
+    const faceEl = tile.querySelector('[data-role="face"]');
+    faceEl.textContent = face ? `F${face}` : 'F?';
+    faceEl.className = 'face-badge' + (face ? ` f${face}` : '');
+    faceEl.title = face ? `Currently displaying face ${face}` : 'Face unknown';
+
+    tile.querySelector('[data-role="en"]'   ).className = 'dot' + (m.enabled ? ' on'    : '');
+    tile.querySelector('[data-role="run"]'  ).className = 'dot' + (m.running ? ' run'   : '');
+    tile.querySelector('[data-role="alarm"]').className = 'dot' + (m.alarm   ? ' alarm' : '');
+  }
 
   if (inv.length && !selectedKey) {
     selectMotor(inv[0].motor_key);
@@ -774,11 +811,8 @@ function renderFocus(d) {
     `;
   }
 
-  // Disable every per-motor action when nothing is selected — avoids silent
-  // toast spam and makes it obvious you need to pick a tile first.
-  $$('#focus-panel button, #focus-panel input, #focus-panel select').forEach(el => {
-    el.disabled = !hasSelection;
-  });
+  // ponytail: handlers already early-return on no selection; no DOM-disable
+  // dance needed (the previous version raced WS ticks against the click).
 }
 
 function renderSequenceRows(d) {
@@ -829,11 +863,13 @@ function doMove() {
 }
 function doEnable()   { if (selectedKey) api('enable',   { motor_key: selectedKey }); }
 function doDisable()  { if (selectedKey) api('disable',  { motor_key: selectedKey }); }
-function doHome()     { if (selectedKey) api('home',     { motor_key: selectedKey, speed_rpm: 10, accel: 200, decel: 200 }); }
+function doHome()     { if (selectedKey) api('home',     { motor_key: selectedKey, speed_rpm: 5, accel: 200, decel: 200 }); }
 function doSetZero()  { if (selectedKey) api('set-zero', { motor_key: selectedKey }); }
+function doSetHome()  { if (selectedKey) { api('set-home', { motor_key: selectedKey }); showToast(`Set Home: ${selectedKey} origin saved to drive.`, 'success'); } }
+function doSetHomeAll() { api('set-home', {}); showToast('Set Home All: current positions saved as drive origins (EEPROM). Show reset to face 1.', 'success'); }
 function doAlarmReset(){ if (selectedKey) api('alarm-reset', { motor_key: selectedKey }); }
 function doEstop()    { api('estop'); }
-function doHomeAll()  { api('home',     { speed_rpm: 10, accel: 200, decel: 200 }); }
+function doHomeAll()  { api('home',     { speed_rpm: 5, accel: 200, decel: 200 }); }
 function doZeroAll()  { api('set-zero', {}); }
 function doSave()     { api('save'); showToast('Save command sent to all drives.', 'success'); }
 function doToggleEnableAll() {
@@ -864,23 +900,34 @@ function doSequence() {
 
 // ============================ Jog ============================
 let jogActive = false;
+let jogStartPromise = null;   // in-flight jog/start, so stop can't race ahead of it
+let jogKey = null;            // motor the jog was issued to (selection may change)
 function startJog(direction) {
   if (jogActive || !selectedKey) return;
   jogActive = true;
+  jogKey = selectedKey;
   V('jog-indicator').textContent = direction > 0 ? '▶ jogging' : '◀ jogging';
-  api('jog/start', {
-    motor_key: selectedKey,
+  jogStartPromise = api('jog/start', {
+    motor_key: jogKey,
     direction,
     speed_rpm: parseInt(V('mv-jog-speed').value),
     accel: parseInt(V('mv-accel').value),
     decel: parseInt(V('mv-decel').value),
   });
 }
-function stopJog() {
+async function stopJog() {
   if (!jogActive) return;
   jogActive = false;
   V('jog-indicator').textContent = 'idle';
-  if (selectedKey) api('jog/stop', { motor_key: selectedKey });
+  const key = jogKey;
+  // Wait for the start request to actually reach the server first — otherwise
+  // a fast press-release can land stop before start, leaving Bit3 latched and
+  // the motor jogging forever. Then send stop (retry once for good measure).
+  try { await jogStartPromise; } catch {}
+  if (key) {
+    await api('jog/stop', { motor_key: key });
+    await api('jog/stop', { motor_key: key });
+  }
 }
 window.addEventListener('mouseup', stopJog);
 window.addEventListener('blur', stopJog);
@@ -903,11 +950,11 @@ async function loadShowEffects() {
 function _showBody(targetPage) {
   return {
     effect: V('show-effect').value,
-    speed_rpm: parseInt(V('show-speed').value || 60),
-    accel: 200,
-    decel: 200,
-    step_ms: parseInt(V('show-step').value || 100),
-    gap_ms: parseInt(V('show-step').value || 100) * 4,
+    speed_rpm: parseInt(V('show-speed').value || 5),
+    accel: parseInt(V('show-accel').value || 500),
+    decel: parseInt(V('show-decel').value || 500),
+    step_ms: parseInt(V('show-step').value || 200),
+    gap_ms: parseInt(V('show-step').value || 200) * 4,
     max_jitter_ms: parseInt(V('show-jitter').value || 1500),
     target_page: (targetPage != null) ? targetPage : null,
   };
@@ -926,11 +973,11 @@ async function toggleAuto() {
     hold_s: parseFloat(V('auto-hold').value || 5),
     direction: parseInt(V('auto-dir').value || 1),
     effect: V('show-effect').value,
-    speed_rpm: parseInt(V('show-speed').value || 60),
-    accel: 200,
-    decel: 200,
-    step_ms: parseInt(V('show-step').value || 100),
-    gap_ms: parseInt(V('show-step').value || 100) * 4,
+    speed_rpm: parseInt(V('show-speed').value || 5),
+    accel: parseInt(V('show-accel').value || 500),
+    decel: parseInt(V('show-decel').value || 500),
+    step_ms: parseInt(V('show-step').value || 200),
+    gap_ms: parseInt(V('show-step').value || 200) * 4,
     max_jitter_ms: parseInt(V('show-jitter').value || 1500),
   });
 }

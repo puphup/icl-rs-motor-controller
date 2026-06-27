@@ -30,13 +30,37 @@ STATUS_PATH_OK = 1 << 5
 # System commands
 ESTOP_REG = 0x6002
 ESTOP_VAL = 0x0040
+# Same control word (0x6002): value 0x21 sets the current position as the
+# origin/zero ("manual set-to-zero", iCL-RS manual). Persist with PERM_SAVE_VAL.
+SET_ORIGIN_REG = 0x6002
+SET_ORIGIN_VAL = 0x0021
 SYSTEM_CMD_REG = 0x1801
 ALARM_RESET_VAL = 0x1111
 PERM_SAVE_VAL = 0x2211
 
 # Motor enable
-SW_ENABLE_REG = 0x000F
+SW_ENABLE_REG = 0x000F          # Pr0.07 "Forced enable by software" — iCL-RS only
 SW_ENABLE_VAL = 1
+
+# DI1 input function (Pr4.02). Factory default 0x0088 = "Enable input, Normally-
+# Closed", which asserts enable on power-up so the shaft can't be turned by
+# hand. Write 0x0000 to make DI1 invalid, hand control to Pr0.07 / SW_ENABLE_REG,
+# then PERM_SAVE_VAL to 0x1801 (SYSTEM_CMD_REG) to persist. iCL-RS only — other
+# driver families have totally different DI register layouts.
+DI1_FUNC_REG     = 0x0145
+DI1_FUNC_INVALID = 0x0000
+
+# Command filter — rounds the linear accel/decel ramp into an S-curve so the
+# motor doesn't jolt at the end of a move. Register unit is 0.1 ms; we write
+# round(COMMAND_FILTER_MS * 10). Drive applies the filter to position commands.
+# If the motor *oscillates* at the stop instead of jolting, the levers are
+# Pr4.25 / 0x0173 (in-position de-jitter) and Pr1.00 / 0x0051 (position-loop Kp).
+CMD_FILTER_REG = 0x00A1
+# Pr2.00 command filter time, register units 0.1 ms, hardware range 0–512
+# (= max 51.2 ms). Values above that are REJECTED by the drive, not clamped, so
+# keep COMMAND_FILTER_MS ≤ 51. 50 ms (register 500) is the practical max smooth.
+COMMAND_FILTER_MS = 50
+CMD_FILTER_MAX_REG = 512
 
 # Physical constants (overridden by config)
 # command_ppr: what the motor expects for move commands (Pr0.01, default 10000)

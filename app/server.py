@@ -107,7 +107,9 @@ async def _build_runtime(cfg: dict):
             if client is None:
                 continue
             key = build_motor_key(m["gateway"], m["slave_id"])
-            new_drivers[key] = make_hardware_driver(m["driver_type"], client, int(m["slave_id"]))
+            d = make_hardware_driver(m["driver_type"], client, int(m["slave_id"]))
+            await d.configure()      # writes S-curve filter on iCL-RS, no-op elsewhere
+            new_drivers[key] = d
     else:
         for m in cfg.get("motors", []):
             key = build_motor_key(m["gateway"], m["slave_id"])
@@ -156,6 +158,42 @@ async def _reload_runtime():
         sequencer = MultiMotorSequencer(drivers=drivers, motor_keys=list(drivers.keys()))
         # Fresh array → face 1 by convention.
         await show.set_current_page(1)
+
+
+async def run_iclrs_setup() -> int:
+    """One-time iCL-RS commissioning: hand enable control to software.
+
+    Builds the runtime from the current config, calls
+    :meth:`ICLRSDriver.configure_software_enable` on every iCL-RS driver
+    (silently skipping anything else), then tears the runtime down. Returns
+    the count of drives that were reconfigured.
+
+    Used by ``launcher.py --setup-iclrs-enable``; not called on normal
+    startup. Other driver families are intentionally untouched.
+    """
+    global gateways, drivers, sim_motors, config
+    from .drivers.icl_rs import ICLRSDriver
+
+    config = load_config()
+    if config.get("mode") != "tcp":
+        print("[setup] mode is not 'tcp'; skipping iCL-RS commissioning")
+        return 0
+    new_g, new_d, new_s = await _build_runtime(config)
+    gateways, drivers, sim_motors = new_g, new_d, new_s
+    try:
+        touched = 0
+        for key, d in drivers.items():
+            if not isinstance(d, ICLRSDriver):
+                continue
+            print(f"[setup] reconfiguring {key} for software enable …")
+            try:
+                await d.configure_software_enable()
+                touched += 1
+            except Exception as e:
+                print(f"[setup] {key} failed: {e}")
+        return touched
+    finally:
+        await _teardown_runtime()
 
 
 @asynccontextmanager
@@ -220,7 +258,7 @@ class MotorKeyRequest(BaseModel):
 
 class HomeRequest(BaseModel):
     motor_key: str | None = None       # None → all motors
-    speed_rpm: int = 10
+    speed_rpm: int = 5
     accel: int = 200
     decel: int = 200
 
@@ -242,6 +280,8 @@ class TransitionRequest(BaseModel):
     step_ms: int = DEFAULT_STEP_MS
     gap_ms: int = DEFAULT_STEP_MS * 4
     max_jitter_ms: int = 1500
+    soft_stop_deg: float = 0.0
+    soft_stop_speed_rpm: int = 0
     target_page: int | None = None     # only used by /goto
 
 
@@ -255,6 +295,8 @@ class AutoCycleRequest(BaseModel):
     step_ms: int = DEFAULT_STEP_MS
     gap_ms: int = DEFAULT_STEP_MS * 4
     max_jitter_ms: int = 1500
+    soft_stop_deg: float = 0.0
+    soft_stop_speed_rpm: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -332,8 +374,7 @@ async def jog_start(req: JogStartRequest):
     d = drivers.get(req.motor_key)
     if d is None:
         return {"error": f"Unknown motor {req.motor_key!r}"}
-    angle = 36000.0 * (1 if req.direction >= 0 else -1)
-    await d.start_move("relative", angle, req.speed_rpm, req.accel, req.decel)
+    await d.jog_start(req.direction, req.speed_rpm, req.accel, req.decel)
     return {"ok": True}
 
 
@@ -344,7 +385,7 @@ async def jog_stop(req: MotorKeyRequest):
     d = drivers.get(req.motor_key)
     if d is None:
         return {"error": f"Unknown motor {req.motor_key!r}"}
-    await d.stop_motion()
+    await d.jog_stop()
     return {"ok": True}
 
 
@@ -352,13 +393,12 @@ async def jog_stop(req: MotorKeyRequest):
 async def home_motor(req: HomeRequest):
     if sequencer.active:
         return {"error": "Sequence in progress"}
-    from .registers import pulses_to_degrees
     for key in _resolve_targets(req.motor_key):
         d = drivers[key]
         home_pulses = zero_offsets.get(key, 0)
         await d.start_move(
             mode="absolute",
-            angle_deg=pulses_to_degrees(home_pulses),
+            angle_deg=d.pulses_to_deg(home_pulses),   # per-driver PPR, not global
             speed_rpm=req.speed_rpm,
             accel=req.accel,
             decel=req.decel,
@@ -381,6 +421,39 @@ async def set_zero(req: MotorKeyRequest):
     if not req.motor_key:
         await show.set_current_page(1)
     return {"ok": True}
+
+
+@app.post("/api/set-home")
+async def set_home(req: MotorKeyRequest):
+    """Make the current physical position the DRIVE's origin and persist it to
+    EEPROM (survives power cycles), unlike /api/set-zero which only stores a
+    software display offset. Also clears that software offset since the drive
+    now reads 0 here."""
+    failed = []
+    for key in _resolve_targets(req.motor_key):
+        d = drivers[key]
+        try:
+            await d.set_home()
+        except Exception as e:
+            failed.append({"motor_key": key, "error": str(e)[:80]})
+            continue
+        # Make the DISPLAY read 0 at the new home too. set_home() clears the
+        # drive's positioning origin (persisted), but on iCL-RS the register we
+        # display (0x1014) is a separate absolute counter that isn't cleared —
+        # so capture a software offset like Set Zero. TL-R's display register
+        # *is* cleared, so its offset lands on 0 naturally.
+        if key in sim_motors:
+            zero_offsets[key] = 0
+        else:
+            try:
+                st = await d.read_status()
+                zero_offsets[key] = int(st.get("position_pulses", 0))
+            except Exception:
+                zero_offsets[key] = 0
+    # Set Home on the whole array → treat the new origin as face 1.
+    if not req.motor_key:
+        await show.set_current_page(1)
+    return {"ok": True, "failed": failed}
 
 
 @app.post("/api/estop")
@@ -408,16 +481,25 @@ async def save_params():
 
 @app.post("/api/enable")
 async def enable_motors(req: MotorKeyRequest = MotorKeyRequest()):
+    # ponytail: per-motor try/except so a dead gateway can't 500 the whole call.
+    failed = []
     for key in _resolve_targets(req.motor_key):
-        await drivers[key].enable()
-    return {"ok": True}
+        try:
+            await drivers[key].enable()
+        except Exception as e:
+            failed.append({"motor_key": key, "error": str(e)[:80]})
+    return {"ok": True, "failed": failed}
 
 
 @app.post("/api/disable")
 async def disable_motors(req: MotorKeyRequest = MotorKeyRequest()):
+    failed = []
     for key in _resolve_targets(req.motor_key):
-        await drivers[key].disable()
-    return {"ok": True}
+        try:
+            await drivers[key].disable()
+        except Exception as e:
+            failed.append({"motor_key": key, "error": str(e)[:80]})
+    return {"ok": True, "failed": failed}
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +528,8 @@ def _opts_from(req: TransitionRequest | AutoCycleRequest) -> TransitionOptions:
         step_ms=int(req.step_ms),
         gap_ms=int(req.gap_ms),
         max_jitter_ms=int(req.max_jitter_ms),
+        soft_stop_deg=float(req.soft_stop_deg),
+        soft_stop_speed_rpm=int(req.soft_stop_speed_rpm),
     )
 
 
@@ -620,7 +704,6 @@ async def _broadcast_loop():
 
 async def _build_status() -> dict:
     """Read live status for every driver and emit a flat motor-keyed dict."""
-    from .registers import pulses_to_degrees
     motors_out: dict[str, dict] = {}
     inventory: list[dict] = []
 
@@ -648,7 +731,7 @@ async def _build_status() -> dict:
             raw_pulses = int(st.get("position_pulses", 0))
             display_pulses = raw_pulses - zero_offsets.get(key, 0)
             st["position_pulses"] = display_pulses
-            st["position_deg"] = round(pulses_to_degrees(display_pulses), 2)
+            st["position_deg"] = round(d.pulses_to_deg(display_pulses), 2)  # per-driver PPR
             st["current_face"] = face_for_position(st["position_deg"])
         else:
             st["current_face"] = None

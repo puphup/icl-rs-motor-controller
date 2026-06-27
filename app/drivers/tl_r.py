@@ -54,6 +54,11 @@ PA_CURRENT_POS_H   = 8
 PA_CURRENT_POS_L   = 9
 PA_CURRENT_SPEED   = 10
 
+# JOG parameters (used with control word Bit 3, a held level)
+PA_JOG_SPEED = 48                # PA_030 — JOG Operating Speed (r/min), signed -3000..3000
+PA_JOG_ACCEL = 49                # PA_031 — JOG Acceleration Time (ms)
+PA_JOG_DECEL = 50                # PA_032 — JOG Deceleration Time (ms)
+
 # Single positioning parameters (used when triggering via control word Bit 0)
 PA_POS_START_SPEED = 51          # PA_033 (not written by us — leave at NVRAM default)
 PA_POS_ACCEL       = 52          # PA_034 — Positioning Acceleration Time (ms)
@@ -94,7 +99,11 @@ OS_IN_POSITION       = 1 << 0
 OS_HOMING_COMPLETE   = 1 << 1
 OS_MOTOR_RUNNING     = 1 << 2
 OS_FAULT             = 1 << 3
-OS_MOTOR_ENABLED     = 1 << 4
+# Bit 4: the manual labels this "Motor Enabled", but on this firmware it is
+# actually set when the motor is RELEASED (free) and clear when energized —
+# verified: enabled idle=0x0001, enabled moving=0x0004, released=0x0010. So
+# enabled = NOT this bit.
+OS_MOTOR_RELEASED    = 1 << 4
 
 
 def _signed16(raw: int) -> int:
@@ -105,9 +114,16 @@ def _signed16(raw: int) -> int:
 class TLRDriver(MotorDriver):
     """TL-R RS485 integrated controller."""
 
-    def __init__(self, modbus: ModbusInterface, slave_id: int):
+    # Reverse the TL-R's rotation sense so it flips the same physical direction
+    # as the iCL-RS drives in the array. Applied to moves, jog, and feedback.
+    direction = -1
+
+    def __init__(self, modbus: ModbusInterface, slave_id: int,
+                 command_ppr: int = 1000, encoder_ppr: int = 1000):
         self.modbus = modbus
         self.slave_id = slave_id
+        self.command_ppr = command_ppr
+        self.encoder_ppr = encoder_ppr
 
     async def _aux(self, code: int) -> None:
         await self.modbus.write_registers(self.slave_id, PA_AUX_CONTROL, [code])
@@ -117,35 +133,118 @@ class TLRDriver(MotorDriver):
         await self.modbus.write_registers(self.slave_id, PA_AUX_CONTROL, [AUX_NONE])
 
     async def _control(self, bits: int) -> None:
-        """Write the control word, then clear it so the next op sees a rising edge."""
+        """Write the control word, briefly hold, then clear so the next op sees
+        a fresh rising edge. The small hold matters for CW_STOP / CW_ESTOP —
+        without it the drive sometimes never sees the edge."""
+        import asyncio as _asyncio
         await self.modbus.write_registers(self.slave_id, PA_CONTROL_WORD, [bits])
+        await _asyncio.sleep(0.05)
         await self.modbus.write_registers(self.slave_id, PA_CONTROL_WORD, [0])
 
-    async def enable(self) -> None:
-        await self._aux(AUX_MOTOR_ENABLE)
+    async def enable(self, state: bool = True) -> None:
+        """Energize/hold (state=True) or release/free (state=False) the shaft.
+
+        TL-R only. Unlike the iCL-RS (persistent level in Pr0.07), the TL-R
+        uses an action CODE written to the Auxiliary Control register
+        PA_04F (0x004F):
+            0x0500 = Motor Enabled   (energize/hold)
+            0x0600 = Motor Release   (free shaft)
+        After issuing the code we read back status word 0x0004 and raise if the
+        actual state doesn't match the request.
+
+        DANGER: do NOT release (state=False) while the motor is holding a load
+        that could drop or back-drive — there's no torque once released.
+        """
+        code = AUX_MOTOR_ENABLE if state else AUX_MOTOR_RELEASE
+        await self._aux(code)
+        import asyncio as _asyncio
+        await _asyncio.sleep(0.1)            # let the status word settle
+        actual = await self.is_enabled()
+        if actual != state:
+            raise IOError(
+                f"TL-R sid={self.slave_id}: enable({state}) not confirmed "
+                f"(is_enabled={actual})"
+            )
 
     async def disable(self) -> None:
-        await self._aux(AUX_MOTOR_RELEASE)
+        """Release the shaft. TL-R only. See :meth:`enable` for the load warning."""
+        await self.enable(False)
+
+    async def is_enabled(self) -> bool:
+        """Read status word 0x0004 and report whether the motor is energized.
+
+        TL-R only. The manual labels bit 4 "Motor Enabled", but on this
+        firmware bit 4 is set when the motor is RELEASED (verified on hardware:
+        enabled-idle=0x0001, enabled-moving=0x0004, released=0x0010). So the
+        true enabled state is the INVERSE of bit 4.
+        """
+        regs = await self.modbus.read_holding_registers(self.slave_id, PA_OPERATING_STATUS, 1)
+        return not bool(regs[0] & OS_MOTOR_RELEASED)
+
+    async def save_parameters(self) -> None:
+        """Persist current parameters to EEPROM. TL-R only — writes the
+        Auxiliary Control 'Save Current Parameters' code (0x0200) to PA_04F."""
+        await self._aux(AUX_SAVE_PARAMETERS)
+
+    async def set_home(self) -> None:
+        """Clear the current position (AUX 0x0400) so the present spot becomes
+        the origin, then persist to EEPROM. TL-R only."""
+        await self._aux(AUX_CLEAR_POSITION)
+        await self.save_parameters()
 
     async def start_move(self, mode, angle_deg, speed_rpm, accel, decel):
-        pulses = degrees_to_pulses(angle_deg)
+        await self.stage_move(mode, angle_deg, speed_rpm, accel, decel)
+        await self.trigger_move()
+
+    async def stage_move(self, mode, angle_deg, speed_rpm, accel, decel):
+        """Write the single-positioning params (PA_034..038) but don't trigger.
+        Remembers the mode so :meth:`trigger_move` knows abs vs rel."""
+        pulses = self.deg_to_pulses(angle_deg)
         pos_h, pos_l = split_32(pulses)
-        # Stage SINGLE-positioning parameters. Writing one register at a time
-        # (function 0x06 under the hood — pymodbus's write_registers with a
-        # length-1 list still uses 0x10, which the TL-R also accepts, but a
-        # multi-register write of 5 contiguous values is silently truncated by
-        # this drive's firmware). One-at-a-time is reliable.
+        # One register at a time — a 5-register block write is silently
+        # truncated by this firmware.
         await self.modbus.write_registers(self.slave_id, PA_POS_ACCEL,    [int(accel)])
         await self.modbus.write_registers(self.slave_id, PA_POS_DECEL,    [int(decel)])
         await self.modbus.write_registers(self.slave_id, PA_POS_SPEED,    [int(speed_rpm)])
         await self.modbus.write_registers(self.slave_id, PA_POS_TARGET_H, [pos_h])
         await self.modbus.write_registers(self.slave_id, PA_POS_TARGET_L, [pos_l])
-
-        # Trigger via control word: positioning enable + mode + interrupt.
         bits = CW_POS_ENABLE | CW_INTERRUPT
         if mode == "absolute":
             bits |= CW_POS_ABSOLUTE
-        await self._control(bits)
+        self._trigger_bits = bits
+
+    async def trigger_move(self) -> None:
+        """Fire the staged move with a clean low→high edge on the control word.
+        Leaves the bits set (clearing Bit0 mid-move truncates it on this
+        firmware)."""
+        bits = getattr(self, "_trigger_bits", CW_POS_ENABLE | CW_INTERRUPT)
+        await self.modbus.write_registers(self.slave_id, PA_CONTROL_WORD, [0])
+        await self.modbus.write_registers(self.slave_id, PA_CONTROL_WORD, [bits])
+
+    async def jog_start(self, direction, speed_rpm, accel, decel):
+        """True TL-R jog: Bit 3 of the control word is a HELD level, not an
+        edge. Speed + direction come from PA_030 (signed). We set the params
+        then raise Bit 3 and leave it high — :meth:`jog_stop` drops it. This
+        is what hold-to-jog should be: nothing keeps spinning if a single
+        stop write is missed, because the motor only moves while the bit is
+        held (and the drive re-reads it continuously)."""
+        # self.direction flips the TL-R to match the iCL-RS rotation sense.
+        spd = int(speed_rpm) * (1 if direction >= 0 else -1) * self.direction
+        await self.modbus.write_registers(self.slave_id, PA_JOG_ACCEL, [int(accel)])
+        await self.modbus.write_registers(self.slave_id, PA_JOG_DECEL, [int(decel)])
+        # signed → 16-bit two's complement
+        await self.modbus.write_registers(self.slave_id, PA_JOG_SPEED, [spd & 0xFFFF])
+        # Raise JOG bit and leave it asserted (do NOT clear).
+        await self.modbus.write_registers(self.slave_id, PA_CONTROL_WORD, [CW_JOG_ENABLE])
+
+    async def jog_stop(self):
+        """Assert the Stop bit (Bit 5) to halt the jog.
+
+        Clearing the control word to 0 is NOT enough — verified on hardware:
+        a move in progress keeps running until Stop is explicitly asserted.
+        _control() pulses Bit 5 high (held 50 ms so the drive catches the
+        edge) then clears it."""
+        await self._control(CW_STOP)
 
     async def stop_motion(self) -> None:
         # Use the "Stop" bit (not e-stop) so the drive decelerates without
@@ -159,7 +258,9 @@ class TLRDriver(MotorDriver):
         await self._aux(AUX_CLEAR_ALARM)
 
     async def save_params(self) -> None:
-        await self._aux(AUX_SAVE_PARAMETERS)
+        # Base-interface name used by the server's /api/save; delegate to the
+        # explicitly-named TL-R method so there's one EEPROM-save code path.
+        await self.save_parameters()
 
     async def read_status(self) -> MotorStatus:
         try:
@@ -179,11 +280,11 @@ class TLRDriver(MotorDriver):
         raw_pulses = join_32_signed(pos_regs[0], pos_regs[1])
         vel_rpm = _signed16(vel_regs[0])
         return {
-            "position_deg": round(pulses_to_degrees(raw_pulses), 2),
+            "position_deg": round(self.pulses_to_deg(raw_pulses), 2),
             "position_pulses": raw_pulses,
             "velocity_rpm": vel_rpm,
             "running": bool(status & OS_MOTOR_RUNNING),
-            "enabled": bool(status & OS_MOTOR_ENABLED),
+            "enabled": not bool(status & OS_MOTOR_RELEASED),
             "estopped": False,
             "alarm": alarm_regs[0],
             "status_bits": status,
