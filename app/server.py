@@ -456,6 +456,27 @@ async def set_home(req: MotorKeyRequest):
     return {"ok": True, "failed": failed}
 
 
+@app.post("/api/reconnect")
+async def reconnect():
+    """Tear down and rebuild every gateway TCP client + driver from the current
+    config. Use when motors show offline after a gateway/PC disconnect — the
+    sockets go stale and don't auto-recover. Returns the online count so the UI
+    can report the result."""
+    try:
+        await _reload_runtime()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    online = 0
+    for key, d in drivers.items():
+        try:
+            st = await d.read_status()
+            if not st.get("offline"):
+                online += 1
+        except Exception:
+            pass
+    return {"ok": True, "online": online, "total": len(drivers)}
+
+
 @app.post("/api/estop")
 async def estop():
     await sequencer.emergency_stop_all()

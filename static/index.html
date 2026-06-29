@@ -356,6 +356,7 @@
       <button type="button" onclick="doZeroAll()" title="Software display offset only (not saved to drives)">Zero All</button>
       <button type="button" onclick="doSetHomeAll()" title="Make current position the drive origin, saved to EEPROM (survives power-cycle). Resets show to face 1.">Set Home All</button>
       <button type="button" onclick="doSave()">Save Params</button>
+      <button type="button" id="btn-reconnect" onclick="doReconnect()" title="Rebuild the gateway connections and the live status link. Use if motors show offline after a gateway/PC disconnect.">Reconnect</button>
       <span class="spacer"></span>
       <span class="counter" id="online-count">0/0 online</span>
     </div>
@@ -872,6 +873,21 @@ function doEstop()    { api('estop'); }
 function doHomeAll()  { api('home',     { speed_rpm: 5, accel: 200, decel: 200 }); }
 function doZeroAll()  { api('set-zero', {}); }
 function doSave()     { api('save'); showToast('Save command sent to all drives.', 'success'); }
+async function doReconnect() {
+  const btn = V('btn-reconnect');
+  btn.disabled = true; btn.textContent = 'Reconnecting…';
+  // 1) Re-open the browser status link if it dropped (e.g. PC slept).
+  try { if (!ws || ws.readyState > 1) connectWS(); } catch {}
+  // 2) Rebuild the backend gateway TCP clients.
+  try {
+    const r = await api('reconnect', {});
+    if (r.ok) showToast(`Reconnected: ${r.online}/${r.total} motors online.`, r.online ? 'success' : 'danger');
+    else showToast('Reconnect failed: ' + (r.error || 'unknown'), 'danger');
+  } catch (e) {
+    showToast('Reconnect error: ' + e.message, 'danger');
+  }
+  btn.disabled = false; btn.textContent = 'Reconnect';
+}
 function doToggleEnableAll() {
   if (motorsEnabled) api('disable', {}); else api('enable', {});
 }
