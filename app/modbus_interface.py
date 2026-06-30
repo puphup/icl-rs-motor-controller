@@ -1,6 +1,7 @@
 """Modbus interface abstraction with simulated and real RS485 implementations."""
 
 import asyncio
+import time
 from abc import ABC, abstractmethod
 
 from .motor_sim import MotorSim
@@ -191,39 +192,79 @@ class TcpModbus(ModbusInterface):
         self._client = ModbusTcpClient(host=host, port=port, timeout=1)
         self._lock = asyncio.Lock()
         self._connected = False
+        # When a connect attempt fails we don't retry until this monotonic time,
+        # so a down gateway fast-fails instead of stalling every motor read with
+        # a fresh 1s connect timeout. ponytail: fixed 2s backoff, good enough.
+        self._next_retry = 0.0
+
+    async def _run(self, fn):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, fn)
+
+    async def _ensure_connected(self) -> bool:
+        if self._connected:
+            return True
+        now = time.monotonic()
+        if now < self._next_retry:
+            return False                      # in backoff window — fast-fail
+        try:
+            self._connected = await self._run(self._client.connect)
+        except Exception:
+            self._connected = False
+        if not self._connected:
+            self._next_retry = now + 2.0
+        return self._connected
 
     async def connect(self):
-        loop = asyncio.get_event_loop()
-        self._connected = await loop.run_in_executor(None, self._client.connect)
-        return self._connected
+        self._next_retry = 0.0                # explicit connect bypasses backoff
+        return await self._ensure_connected()
 
     async def disconnect(self):
         if self._connected:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._client.close)
+            try:
+                await self._run(self._client.close)
+            except Exception:
+                pass
             self._connected = False
 
-    async def write_registers(self, slave_id: int, start_addr: int, values: list[int]) -> None:
-        if not self._connected:
-            raise ConnectionError("Not connected to Modbus TCP host")
-        async with self._lock:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, lambda: self._client.write_registers(start_addr, values, device_id=slave_id)
-            )
+    async def _op(self, fn):
+        """Run a client op with one reconnect-and-retry if the socket dropped.
+
+        This is the self-heal: a gateway reboot / idle-timeout closes the
+        underlying socket, and pymodbus does NOT reconnect on its own — every
+        later call fails forever. Here, on any failure we drop the dead socket,
+        reconnect once, and retry, so the next poll recovers automatically with
+        no user action."""
+        if not await self._ensure_connected():
+            raise ConnectionError("Modbus TCP host not connected")
+        try:
+            result = await self._run(fn)
             if result.isError():
-                raise IOError(f"Write error: {result}")
+                raise IOError(str(result))
+            return result
+        except Exception:
+            # Socket likely dead → close, reconnect once, retry.
+            self._connected = False
+            try:
+                await self._run(self._client.close)
+            except Exception:
+                pass
+            if not await self._ensure_connected():
+                raise
+            result = await self._run(fn)
+            if result.isError():
+                raise IOError(str(result))
+            return result
+
+    async def write_registers(self, slave_id: int, start_addr: int, values: list[int]) -> None:
+        async with self._lock:
+            await self._op(lambda: self._client.write_registers(start_addr, values, device_id=slave_id))
 
     async def read_holding_registers(self, slave_id: int, start_addr: int, count: int) -> list[int]:
-        if not self._connected:
-            raise ConnectionError("Not connected to Modbus TCP host")
         async with self._lock:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, lambda: self._client.read_holding_registers(start_addr, count=count, device_id=slave_id)
+            result = await self._op(
+                lambda: self._client.read_holding_registers(start_addr, count=count, device_id=slave_id)
             )
-            if result.isError():
-                raise IOError(f"Read error: {result}")
             return list(result.registers)
 
     async def test_connection(self, slave_id: int) -> dict:
