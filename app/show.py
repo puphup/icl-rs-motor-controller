@@ -310,15 +310,45 @@ class ShowController:
                 pass
         await asyncio.gather(*(_trigger(k, dly) for k, dly in schedule))
 
+    async def _wait_all_stopped(self, drivers: dict[str, MotorDriver],
+                                timeout: float = 60.0) -> None:
+        """Block until every motor reports not-running, so the NEXT flip can't
+        interrupt a motor still mid-rotation (which would shift its face off by
+        the un-finished angle). Offline motors read not-running so they don't
+        block; a safety timeout means one genuinely-stuck motor can't freeze
+        the whole cycle."""
+        # Give the moves a moment to actually start before we poll, otherwise
+        # a just-triggered motor still reads 'in position' from the prior face.
+        await asyncio.sleep(0.4)
+        waited = 0.4
+        while waited < timeout:
+            if not self.auto.running:
+                return
+            sts = await asyncio.gather(
+                *(d.read_status() for d in drivers.values()),
+                return_exceptions=True,
+            )
+            still = any(isinstance(s, dict) and s.get("running") for s in sts)
+            if not still:
+                return
+            await asyncio.sleep(0.2)
+            waited += 0.2
+
     async def _auto_loop(self, drivers: dict[str, MotorDriver]):
         try:
             while True:
-                # Sleep the hold, then transition once
+                opts = self.auto.options
+                # 1) Flip to the next face.
+                await self._step(drivers, +1 if self.auto.direction >= 0 else -1, opts)
+                # 2) Wait until EVERY motor has finished this rotation — so the
+                #    next flip never interrupts a still-moving motor.
+                await self._wait_all_stopped(drivers)
+                if not self.auto.running:
+                    return
+                # 3) Hold on the now fully-settled face.
                 await asyncio.sleep(self.auto.hold_s)
                 if not self.auto.running:
                     return
-                opts = self.auto.options
-                await self._step(drivers, +1 if self.auto.direction >= 0 else -1, opts)
         except asyncio.CancelledError:
             return
         finally:
