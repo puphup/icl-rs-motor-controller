@@ -423,29 +423,34 @@ async def jog_stop(req: MotorKeyRequest):
 
 @app.post("/api/home")
 async def home_motor(req: HomeRequest):
-    """Drive motor(s) to the home the drive remembers — its origin (absolute 0),
-    the position taught by Set Home and saved to EEPROM. This is 'homing' (move
-    to home), distinct from Set Home (teach current position as home)."""
+    """Drive motor(s) to face 1 by the SHORTEST path — the nearest whole-turn
+    orientation of the taught home, not a full unwind back to absolute 0. The
+    whole array uses the show's commanded angle as the truth (all motors are
+    synchronized to it); a single-motor Home reads that motor's own angle."""
     if sequencer.active:
         return {"error": "Sequence in progress"}
     targets = _resolve_targets(req.motor_key)
+    # Array Home: snap the show to the nearest face-1 turn and send every motor
+    # to that same angle, keeping them in lockstep for the next flip.
+    array_target = None if req.motor_key else show.snap_to_face1()
     failed = []
     for key in targets:
         d = drivers[key]
         try:
+            if array_target is not None:
+                nearest = array_target
+            else:
+                st = await d.read_status()
+                nearest = round(st.get("position_deg", 0.0) / 360.0) * 360.0
             await d.start_move(
                 mode="absolute",
-                angle_deg=0.0,   # the drive origin = the taught/stored home (face 1)
+                angle_deg=nearest,
                 speed_rpm=req.speed_rpm,
                 accel=req.accel,
                 decel=req.decel,
             )
         except Exception as e:
             failed.append({"motor_key": key, "error": str(e)[:80]})
-    # Homing the whole array returns it to the origin = face 1; re-anchor the
-    # show's absolute target so the next flip commands +120 from here.
-    if not req.motor_key:
-        await show.set_current_page(1)
     return {"ok": True, "total": len(targets), "done": len(targets) - len(failed), "failed": failed}
 
 

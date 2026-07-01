@@ -247,6 +247,15 @@ class ShowController:
         self.current_page = ((int(page) - 1) % 3) + 1
         self.target_deg = float((self.current_page - 1) * PAGE_STEP_DEG)
 
+    def snap_to_face1(self) -> float:
+        """Re-anchor the show to face 1 by the SHORTEST path: snap the absolute
+        target to the nearest whole turn (multiple of 360) instead of unwinding
+        back to 0. Returns that angle so the caller can command the motors to it.
+        The next flip then adds +120 from here, staying synchronized."""
+        self.target_deg = round(self.target_deg / 360.0) * 360.0
+        self.current_page = 1
+        return self.target_deg
+
     # ------------------------------------------------------------------
     # Auto-cycle
     # ------------------------------------------------------------------
