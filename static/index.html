@@ -236,6 +236,7 @@
   }
   .pip.active { background: var(--accent); color: #fff; border-color: var(--accent); box-shadow: 0 0 10px rgba(91,141,239,0.6); }
   .pip:hover:not(.active) { background: var(--surface3); color: var(--text); }
+  .pip.pip-disabled { opacity: 0.4; pointer-events: none; }
   .show-btn-big { padding: 10px 18px; font-size: 0.9rem; }
   .show-detail { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 8px; margin-top: 10px; }
   @media (max-width: 1000px) { .show-detail { grid-template-columns: 1fr 1fr; } }
@@ -374,8 +375,8 @@
           <span class="pip" data-page="2" onclick="showGoto(2)">2</span>
           <span class="pip" data-page="3" onclick="showGoto(3)">3</span>
         </div>
-        <button type="button" class="show-btn-big" onclick="showPrev()">◀ Prev face</button>
-        <button type="button" class="btn-primary show-btn-big" onclick="showNext()">Next face ▶</button>
+        <button type="button" id="btn-prev-face" class="show-btn-big" onclick="showPrev()">◀ Prev face</button>
+        <button type="button" id="btn-next-face" class="btn-primary show-btn-big" onclick="showNext()">Next face ▶</button>
         <span class="spacer"></span>
         <span style="font-size:0.7rem; color:var(--text-dim);">
           On <b id="show-current-page">1</b> of 3 ·
@@ -619,6 +620,7 @@ let selectedKey = null;
 let motorsEnabled = false;
 let showEffects = [];
 let autoRunning = false;
+let showBusy = false;      // a flip is in progress → block manual flips
 let setupDraft = {              // local working copy of setup tab data
   mode: 'simulation',
   gateways: [],
@@ -693,6 +695,13 @@ function updateShowState(show) {
     : 'stopped';
   V('btn-auto').textContent = autoRunning ? 'Stop auto-cycle' : 'Start auto-cycle';
   V('btn-auto').className = autoRunning ? 'btn-danger' : 'btn-success';
+
+  // While a flip is in progress (motors moving or auto running), disable the
+  // manual flip controls so a click can't interrupt a still-moving motor.
+  showBusy = !!show.busy;
+  V('btn-next-face').disabled = showBusy;
+  V('btn-prev-face').disabled = showBusy;
+  $$('#show-pips .pip').forEach(p => p.classList.toggle('pip-disabled', showBusy));
 }
 
 function updateHeaderBadges(d) {
@@ -1009,9 +1018,13 @@ function _showBody(targetPage) {
   };
 }
 
-async function showNext() { await api('show/next', _showBody()); }
-async function showPrev() { await api('show/prev', _showBody()); }
-async function showGoto(page) { await api('show/goto', _showBody(page)); }
+function _flipResult(r) {
+  // Server rejects a flip if motors are still finishing the last one.
+  if (r && r.rejected) showToast(r.error || 'Motors still moving — wait for the flip to finish.', 'danger');
+}
+async function showNext() { if (showBusy) return; _flipResult(await api('show/next', _showBody())); }
+async function showPrev() { if (showBusy) return; _flipResult(await api('show/prev', _showBody())); }
+async function showGoto(page) { if (showBusy) return; _flipResult(await api('show/goto', _showBody(page))); }
 
 async function toggleAuto() {
   if (autoRunning) {

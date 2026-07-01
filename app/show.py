@@ -166,6 +166,11 @@ class ShowController:
         self.last_transition_at_motor_count: int = 0
         self._lock = asyncio.Lock()
         self.auto = AutoCycle()
+        # True from the moment a MANUAL flip fires until every motor has
+        # finished rotating. Blocks another manual flip mid-rotation, which
+        # would interrupt still-moving motors and leave them off-face.
+        self.busy: bool = False
+        self._settle_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -176,6 +181,9 @@ class ShowController:
             "current_page": self.current_page,
             "pages": list(PAGES),
             "last_effect": self.last_effect,
+            # True while a flip is in progress (manual busy or auto running) —
+            # the UI uses this to disable Next/Prev/Goto until motors settle.
+            "busy": self.busy or self.auto.running,
             "auto": {
                 "running": self.auto.running,
                 "direction": self.auto.direction,
@@ -184,23 +192,46 @@ class ShowController:
             },
         }
 
-    async def next_page(self, drivers: dict[str, MotorDriver], opts: TransitionOptions):
-        await self._step(drivers, +1, opts)
+    async def _manual_step(self, drivers, delta_pages, opts) -> bool:
+        """Fire a manual flip, but only if the array is idle. Returns False
+        (rejected) if a flip is still in progress or auto-cycle is running —
+        firing now would interrupt still-moving motors and shift their face."""
+        if self.busy or self.auto.running:
+            return False
+        self.busy = True
+        try:
+            await self._step(drivers, delta_pages, opts)
+        except Exception:
+            self.busy = False
+            raise
+        # Clear busy in the background once every motor has stopped, so the
+        # HTTP call returns immediately (the button doesn't hang for the move).
+        self._settle_task = asyncio.create_task(self._settle(drivers))
+        return True
 
-    async def prev_page(self, drivers: dict[str, MotorDriver], opts: TransitionOptions):
-        await self._step(drivers, -1, opts)
+    async def _settle(self, drivers):
+        try:
+            await self._wait_all_stopped(drivers)
+        finally:
+            self.busy = False
 
-    async def goto(self, drivers: dict[str, MotorDriver], target_page: int, opts: TransitionOptions):
+    async def next_page(self, drivers: dict[str, MotorDriver], opts: TransitionOptions) -> bool:
+        return await self._manual_step(drivers, +1, opts)
+
+    async def prev_page(self, drivers: dict[str, MotorDriver], opts: TransitionOptions) -> bool:
+        return await self._manual_step(drivers, -1, opts)
+
+    async def goto(self, drivers: dict[str, MotorDriver], target_page: int, opts: TransitionOptions) -> bool:
         target_page = ((int(target_page) - 1) % 3) + 1
         if target_page == self.current_page:
-            return
+            return True
         # Shortest mechanical path — prefer the one-step rotation that gets
         # there, choosing sign. e.g. 1 → 3 picks -1 (reverse), not +2.
         raw = target_page - self.current_page                # ∈ {-2,-1,1,2}
         if raw == 2:   delta = -1
         elif raw == -2: delta = 1
         else:           delta = raw
-        await self._step(drivers, delta, opts)
+        return await self._manual_step(drivers, delta, opts)
 
     async def set_current_page(self, page: int):
         """Manually set what page the array is considered to be on (e.g. after a

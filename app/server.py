@@ -596,20 +596,25 @@ async def show_state():
     return show.state()
 
 
+_BUSY_MSG = "Motors still finishing the last flip — wait until they stop."
+
+
 @app.post("/api/show/next")
 async def show_next(req: TransitionRequest = TransitionRequest()):
     if sequencer is not None and sequencer.active:
         return {"error": "Sequence in progress"}
-    await show.next_page(drivers, _opts_from(req))
-    return {"ok": True, **show.state()}
+    fired = await show.next_page(drivers, _opts_from(req))
+    return {"ok": fired, "rejected": not fired,
+            "error": None if fired else _BUSY_MSG, **show.state()}
 
 
 @app.post("/api/show/prev")
 async def show_prev(req: TransitionRequest = TransitionRequest()):
     if sequencer is not None and sequencer.active:
         return {"error": "Sequence in progress"}
-    await show.prev_page(drivers, _opts_from(req))
-    return {"ok": True, **show.state()}
+    fired = await show.prev_page(drivers, _opts_from(req))
+    return {"ok": fired, "rejected": not fired,
+            "error": None if fired else _BUSY_MSG, **show.state()}
 
 
 @app.post("/api/show/goto")
@@ -618,8 +623,9 @@ async def show_goto(req: TransitionRequest):
         return {"error": "Sequence in progress"}
     if req.target_page is None:
         return {"error": "target_page required"}
-    await show.goto(drivers, int(req.target_page), _opts_from(req))
-    return {"ok": True, **show.state()}
+    fired = await show.goto(drivers, int(req.target_page), _opts_from(req))
+    return {"ok": fired, "rejected": not fired,
+            "error": None if fired else _BUSY_MSG, **show.state()}
 
 
 @app.post("/api/show/set-current-page")
