@@ -171,6 +171,12 @@ class ShowController:
         # would interrupt still-moving motors and leave them off-face.
         self.busy: bool = False
         self._settle_task: asyncio.Task | None = None
+        # Cumulative ABSOLUTE target angle (deg) the array should be at, 0 =
+        # face 1 = home. Each flip adds ±120 and we command an absolute move to
+        # this exact value, so per-flip pulse rounding can't accumulate (it's
+        # exact at every full turn) and the closed-loop drive re-corrects any
+        # physical drift back onto the true face every cycle.
+        self.target_deg: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -235,8 +241,11 @@ class ShowController:
 
     async def set_current_page(self, page: int):
         """Manually set what page the array is considered to be on (e.g. after a
-        Set Zero, when face 1 is freshly aligned). Doesn't move any motors."""
+        Set Zero / Set Home, when the drives are freshly zeroed at face 1).
+        Doesn't move any motors — but re-anchors the absolute target to this
+        face so the next flip commands the right absolute angle."""
         self.current_page = ((int(page) - 1) % 3) + 1
+        self.target_deg = float((self.current_page - 1) * PAGE_STEP_DEG)
 
     # ------------------------------------------------------------------
     # Auto-cycle
@@ -272,20 +281,23 @@ class ShowController:
     async def _step(self, drivers: dict[str, MotorDriver], delta_pages: int,
                     opts: TransitionOptions):
         """``delta_pages`` is signed — positive rotates forward (angle ↑),
-        negative rotates backward (angle ↓). The page bookkeeping wraps mod 3
-        either way."""
+        negative rotates backward (angle ↓). We advance the cumulative absolute
+        target and command every motor to that exact absolute angle, so drift
+        can't accumulate across flips."""
         delta_pages = int(delta_pages)
         if delta_pages == 0:
             return
         async with self._lock:
-            await self._fire_transition(drivers, delta_pages, opts)
-            self.current_page = ((self.current_page - 1 + delta_pages) % 3) + 1
+            self.target_deg += delta_pages * PAGE_STEP_DEG
+            await self._fire_transition(drivers, opts)
+            self.current_page = (int(round(self.target_deg / PAGE_STEP_DEG)) % 3) + 1
             self.last_effect = opts.effect
 
     async def _fire_transition(self, drivers: dict[str, MotorDriver],
-                               delta_pages: int, opts: TransitionOptions):
-        # ``delta_pages`` is signed so motor angle moves the same direction
-        # the operator clicked: Next → +120°, Prev → -120°.
+                               opts: TransitionOptions):
+        # Command an ABSOLUTE move to self.target_deg (the exact cumulative face
+        # angle) rather than a relative +120°, so per-flip rounding never
+        # accumulates and the drive re-corrects drift onto the true face.
         keys = list(drivers.keys())
         if not keys:
             return
@@ -293,7 +305,7 @@ class ShowController:
         schedule = builder(keys, vars(opts))
         self.last_transition_at_motor_count = len(keys)
 
-        angle_deg = PAGE_STEP_DEG * delta_pages
+        target_deg = self.target_deg
 
         # Auto-enable every motor before firing. A Trivision controller is
         # operationally weird if "Next face" silently no-ops because the motors
@@ -323,7 +335,7 @@ class ShowController:
             if d is None:
                 return
             try:
-                await d.stage_move("relative", angle_deg, opts.speed_rpm,
+                await d.stage_move("absolute", target_deg, opts.speed_rpm,
                                    opts.accel, opts.decel)
             except Exception:
                 pass
